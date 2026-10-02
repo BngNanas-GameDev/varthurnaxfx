@@ -10,6 +10,7 @@ COPY requirements-test.txt requirements.txt* ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 COPY configs/ ./configs/
 COPY runbooks/ ./runbooks/
 
