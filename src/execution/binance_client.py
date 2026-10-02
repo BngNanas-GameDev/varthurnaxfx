@@ -51,10 +51,16 @@ class BinanceClient:
         if dry_run is None:
             dry_run = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
         self.dry_run = bool(dry_run)
+        if not api_key:
+            api_key = os.getenv("BINANCE_API_KEY", "")
+        if not api_secret:
+            api_secret = os.getenv("BINANCE_API_SECRET", "")
         self.testnet = bool(testnet)
         self.max_retries = max(1, int(max_retries))
         self._exchange: Any = None
         if not self.dry_run:
+            if not api_key or not api_secret:
+                raise RuntimeError("BINANCE_API_KEY/SECRET kosong (isi .env dulu)")
             self._exchange = self._build_exchange(api_key, api_secret, testnet)
 
     # -- setup -------------------------------------------------------------
