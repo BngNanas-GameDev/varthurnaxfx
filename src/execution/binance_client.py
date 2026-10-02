@@ -71,7 +71,13 @@ class BinanceClient:
             raise RuntimeError("ccxt is required for live/testnet mode (pip install ccxt)") from exc
         ex = ccxt.binanceusdm({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
         if testnet:
-            ex.set_sandbox_mode(True)
+            # ccxt >=4.x menolah set_sandbox_mode untuk binance futures;
+            # pakai tabel urls['test'] bawaan ccxt (terverifikasi via scripts/ccxt_probe.py).
+            test_urls = (ex.urls or {}).get("test") or {}
+            if test_urls:
+                ex.urls["api"].update(test_urls)
+            else:
+                ex.set_sandbox_mode(True)
         return ex
 
     # -- retry helper -------------------------------------------------------
