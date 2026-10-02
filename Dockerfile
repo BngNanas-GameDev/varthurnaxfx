@@ -7,8 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements-test.txt requirements.txt* ./
-RUN pip install --no-cache-dir -r requirements-test.txt \
-    && pip install --no-cache-dir ccxt || true
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY configs/ ./configs/
