@@ -32,6 +32,8 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
 
     client = BinanceClient()  # reads DRY_RUN / testnet env internally
     last_ws_msg_ts = time.time()
+    ws_connected = False  # set True once a real WS callback delivers messages
+    rest_mode_logged = False
     halt_latched = False
     it = 0
     logger.info("daemon start poll=%.1fs ws_stale=%.0fs dry_run=%s",
@@ -43,7 +45,16 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
             # by the websocket callback; here we treat >10s without update
             # as stale and force a REST fallback read.
             stale_for = time.time() - last_ws_msg_ts
-            if stale_for > WS_STALE_S:
+            if not ws_connected:
+                # No WS feed attached yet (Phase-1 stub): REST polling is the
+                # primary feed, not a fallback. Log once, keep-alive quietly.
+                if not rest_mode_logged:
+                    logger.info("WS not connected, using REST polling as primary feed")
+                    rest_mode_logged = True
+                client.get_position()  # keep-alive REST read
+                last_ws_msg_ts = time.time()
+                logger.debug("REST keep-alive read")
+            elif stale_for > WS_STALE_S:
                 logger.warning("WS stale %.1fs > %.0fs, REST fallback read", stale_for, WS_STALE_S)
                 client.get_position()  # keep-alive REST read
                 last_ws_msg_ts = time.time()
