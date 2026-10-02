@@ -1,0 +1,10 @@
+{
+  "orchestrator_l1": "inclusionai/ling-3.0-flash",
+  "orchestrator_l2_fallback": "inclusionai/ling-3.1-flash",
+  "strategy": "inclusionai/ling-3.0-flash-fin",
+  "risk": "inclusionai/ling-3.0-flash-fin",
+  "execution_fast": "inclusionai/ling-3.0-flash",
+  "timeout_s": 25,
+  "max_retries": 2,
+  "notes": "Fallback chain L1 -> L2 -> degraded. L1 (ling-3.0-flash, paid) supports response_format structured outputs. L2 fallback (ling-3.1-flash, 25B active) supports tools but NOT structured_outputs, so router must validate JSON manually. L3 degraded = deterministic code path, no-trade (FLAT signal, halt order flow). Model names overridable via env OPENROUTER_PRIMARY / OPENROUTER_FALLBACK. Never hardcode API key; use OPENROUTER_API_KEY env."
+}

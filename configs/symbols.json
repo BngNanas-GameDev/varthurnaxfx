@@ -1,0 +1,19 @@
+{
+  "symbol": "BTCUSDT",
+  "binance_usdm_symbol": "BTC/USDT:USDT",
+  "contract": "BTCUSDT-PERP",
+  "margin_mode": "isolated",
+  "timeframes": ["1m", "5m", "1h"],
+  "primary_timeframe": "1h",
+  "fee_taker": 0.0005,
+  "fee_maker": 0.0002,
+  "slippage_bps": 5,
+  "leverage_default": 10,
+  "leverage_max": 125,
+  "risk_per_trade_pct": 0.01,
+  "daily_stop_pct": -0.05,
+  "min_qty": 0.001,
+  "qty_step": 0.001,
+  "contract_size": 1.0,
+  "notes": "fee_taker 0.05% untuk PnL net; slippage default 5bps per sisi."
+}

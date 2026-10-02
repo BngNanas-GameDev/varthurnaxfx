@@ -1,0 +1,12 @@
+{
+  "symbol": "BTCUSDT",
+  "exchange_symbol": "BTCUSDT-PERP (Binance USDT-M Futures)",
+  "margin": "isolated",
+  "leverage_default": 10,
+  "leverage_max": 50,
+  "daily_stop_pct": 5,
+  "risk_per_trade_pct": 1,
+  "max_positions": 1,
+  "ws_stale_sec": 10,
+  "fee_halt_ratio": 0.3
+}

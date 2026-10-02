@@ -1,0 +1,13 @@
+services:
+  tradeagent:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DRY_RUN: "${DRY_RUN:-true}"
+      BINANCE_TESTNET: "${BINANCE_TESTNET:-true}"
+      POLL_INTERVAL_S: "${POLL_INTERVAL_S:-5}"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+    restart: unless-stopped

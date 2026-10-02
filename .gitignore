@@ -1,0 +1,23 @@
+# secrets — jangan pernah push
+.env
+*.key
+*.pem
+
+# runtime state
+STATE
+*.log
+
+# data — hanya keep struktur, bukan isi
+data/bronze/*
+data/silver/*
+data/gold/*
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
