@@ -23,3 +23,17 @@
 ## Promosi / rollback
 - Promosi hanya jika paper 1-2 minggu + testnet hijau.
 - Rollback: `cancel_all()` + close posisi + set `DRY_RUN=true` + latch STATE.
+
+## 4. PAPER TESTNET (validasi kering tanpa key)
+- Validasi paper end-to-end tanpa API key (public REST saja):
+  1. `python -m src.data.live_feed --interval 1h --limit 200 --save`
+     (cek `fetched=N bars=N` + file `data/bronze/klines_1h_<ts>.jsonl`).
+  2. `python scripts/paper_validate.py` (atau `--synthetic` bila network diblokir;
+     catat sumber data di ringkasan). Exit 0 = semua langkah jalan
+     (sinyal FLAT/NO-TRADE adalah hasil valid, bukan gagal).
+- Bila hijau, lanjut testnet strategi:
+  `ENABLE_STRATEGY=true` di testnet, pantau 48 jam.
+- Kriteria lolos paper-testnet:
+  - Tidak ada order ganda (cek idempotency `trace_id` / satu sinyal = maks satu order).
+  - Tidak ada halt palsu (killswitch -5% tidak trigger tanpa drawdown riil).
+  - Sizing <= risk 1%/trade (cek output `calc_qty` / `risk_check OK`).

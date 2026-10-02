@@ -63,6 +63,24 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
                 logger.error("KILLSWITCH: halt pnl=%s", daily_pnl)
                 send_alert(f"KILLSWITCH halt latched (daily_pnl={daily_pnl})")
                 client.cancel_all()
+            if os.getenv("ENABLE_STRATEGY", "false").lower() in ("1", "true", "yes"):
+                # Strategy paper-trading (testnet). Error di sini tak boleh
+                # mematikan daemon: tangkap, log, lanjut iterasi.
+                try:
+                    try:
+                        from src.trading.loop import run_cycle
+                    except ImportError:
+                        from trading.loop import run_cycle  # noqa: E402
+                    try:
+                        equity = float(os.getenv("PAPER_EQUITY", "1000"))
+                    except ValueError:
+                        equity = 1000.0
+                    result = run_cycle(client, equity)
+                    logger.info("strategy cycle: action=%s ordered=%s reason=%s",
+                                result.get("action"), result.get("ordered"),
+                                result.get("reason"))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("strategy cycle error (continuing): %s", exc)
             it += 1
             if max_iters is not None and it >= max_iters:
                 break
