@@ -12,3 +12,4 @@ if isinstance(api, dict):
 else:
     print("api =", api)
 print("test =", urls.get("test"))
+print("demo =", urls.get("demo"))
