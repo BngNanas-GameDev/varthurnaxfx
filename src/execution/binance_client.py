@@ -71,6 +71,10 @@ class BinanceClient:
             raise RuntimeError("ccxt is required for live/testnet mode (pip install ccxt)") from exc
         ex = ccxt.binanceusdm({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
         demo = os.getenv("BINANCE_DEMO", "true").lower() in ("1", "true", "yes")
+        if demo or testnet:
+            # Mode non-live: jangan pernah sentuh sapi/mainnet (fetchCurrencies
+            # memanggil sapi signed). Pasar fapi di-override ke demo/test di bawah.
+            ex.options["fetchCurrencies"] = False
         if demo:
             # Binance mengganti futures-testnet dengan demo trading;
             # tabel urls['demo'] bawaan ccxt (terverifikasi via scripts/ccxt_probe.py).

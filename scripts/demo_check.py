@@ -9,6 +9,10 @@ from src.execution.binance_client import BinanceClient, SYMBOL
 
 client = BinanceClient(dry_run=False)
 print("dry_run=", client.dry_run)
+hosts = client._exchange.urls["api"]
+print("fapiPrivate=", hosts.get("fapiPrivate"))
+print("fapiPublic=", hosts.get("fapiPublic"))
+assert "demo" in (hosts.get("fapiPrivate") or "") or "testnet" in (hosts.get("fapiPrivate") or ""), "FAIL-CLOSED: fapi bukan demo/testnet, abort"
 bal = client._call_with_retry("fetch_balance")
 usdt = (bal or {}).get("USDT", {})
 print("USDT free=", usdt.get("free"), "total=", usdt.get("total"))
