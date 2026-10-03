@@ -40,3 +40,23 @@ Locked context: BTCUSDT-PERP, isolated 10x, API trade-only (no withdraw) + IP wh
 |------|------|------|-----------|
 | Eng  |      |      |           |
 | Risk |      |      |           |
+
+## 6. Preflight (cek mesin) vs manual (dashboard Binance)
+Hasil `python scripts/preflight.py` (exit 0 = PASS, 1 = FAIL). Yang TIDAK bisa
+dicek mesin HARUS dicek manual di dashboard — jangan skip.
+
+| # | Item | Cara cek |
+|---|------|----------|
+| M1 | Key Futures-only, Withdrawals OFF | MANUAL dashboard API Management (preflight hanya cek env `BINANCE_WITHDRAW_ENABLED`) |
+| M2 | IP whitelist = egress IP host live; akses IP lain ditolak | MANUAL: tes dari IP non-whitelist, catat tanggal |
+| M3 | Isolated 10x terlihat di UI posisi | MANUAL di position/margin mode (preflight cek konstanta kode saja) |
+| M4 | SL/TP native menempel tiap entry live | MANUAL di open orders (preflight cek `validate_order` menolak tanpa SL) |
+| M5 | Key lama di-disable setelah rotasi | MANUAL dashboard (preflight cek `KEY_ROTATED_AT` umur saja) |
+| P1 | `.env` ada & key terisi (panjang saja, tanpa nilai) | MESIN: preflight (a) |
+| P2 | Tanpa silent-live (DRY_RUN/DEMO/TESTNET/ALLOW_LIVE konsisten) | MESIN: preflight (b) |
+| P3 | `configs/risk.json` cocok konstanta kode (lev 10, halt -5%, risk 1%) | MESIN: preflight (c). CATATAN: `leverage_max` harus <= 10 (burn-in); nilai 50 = FAIL sampai direkonsiliasi owner risk.json |
+| P4 | Guard menolak tanpa-SL + leverage > 10 | MESIN: preflight (d) |
+| P5 | Killswitch halt pada -5% | MESIN: preflight (e) |
+| P6 | `pytest -q` hijau | MESIN: CI/lokal (bukti testnet di seksi 3 di atas) |
+
+Aturan: P1-P6 + M1-M5 semua hijau sebelum mainnet. Satu FAIL = berhenti.

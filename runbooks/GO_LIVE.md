@@ -37,3 +37,30 @@
   - Tidak ada order ganda (cek idempotency `trace_id` / satu sinyal = maks satu order).
   - Tidak ada halt palsu (killswitch -5% tidak trigger tanpa drawdown riil).
   - Sizing <= risk 1%/trade (cek output `calc_qty` / `risk_check OK`).
+
+## 5. MAINNET (modal kecil — HANYA setelah 1-4 hijau + preflight PASS)
+> Gate: `python scripts/preflight.py` harus exit 0. Bila FAIL, berhenti di sini.
+
+Urutan promosi demo -> mainnet kecil (jangan loncat langkah):
+1. Akun mainnet khusus bot, modal kecil (siap hilang). Key BARU trade-only:
+   Futures enable, Spot/Margin/Withdrawals OFF.
+2. IP whitelist di dashboard Binance = egress IP host live saja. Tes dari IP
+   lain harus gagal (bukti429/block, catat tanggal).
+3. Withdraw-disabled double-check: dashboard Withdrawals OFF + env
+   `BINANCE_WITHDRAW_ENABLED` unset/false (`validate_permissions()` ok).
+4. `.env` host live: `BINANCE_DEMO=false`, `BINANCE_TESTNET=false`,
+   `DRY_RUN=false`, leverage tetap 10x isolated, risk 1%/trade.
+5. `ALLOW_LIVE=true` PALING TERAKHIR, hanya di host live, setelah 1-4 + preflight
+   PASS. Jangan pernah commit `.env` berisi `ALLOW_LIVE=true`.
+6. Pantau 72 jam penuh: posisi tunggal, SL/TP native menempel tiap entry,
+   WS-stale 10s tanpa spam, alert webhook bunyi.
+7. Rotasi key < 90 hari (`KEY_ROTATED_AT` diisi, `rotation_reminder()` > 14d).
+
+Kriteria rollback (salah satu terpenuhi -> rollback SEKARANG):
+- Drawdown harian menyentuh -5% (killswitch latch) -> ikut `runbooks/HALT_RESUME.md`.
+- SL/TP orphan (posisi tanpa protective order) terlihat di UI.
+- Order ganda / double-fill (`trace_id` duplikat) walau sekali.
+- Secret muncul di log, atau key/secret terekspos di mana pun.
+- Perilaku di luar burn-in: leverage > 10, notional > equity*lev, posisi > 1.
+- Cara rollback: `cancel_all()` + close posisi via market `closePosition` +
+  set `DRY_RUN=true` + latch STATE + cabut `ALLOW_LIVE` (unset/false).

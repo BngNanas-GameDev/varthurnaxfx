@@ -29,6 +29,8 @@ try:  # dijalankan dari repo-root (daemon: python -m src.ops.daemon)
     from src.trading.state import load as _load_state
     from src.trading.state import save as _save_state
     from src.trading.state import trip_halt as _trip_halt
+    from src.trading.journal import record_close as _journal_close
+    from src.trading.journal import record_open as _journal_open
 except ImportError:  # dijalankan dengan src/ di sys.path (pytest tests/)
     from data.pipeline import GOLD_DIR as _PIPELINE_GOLD_DIR  # type: ignore[no-redef]
     from execution.order_guard import validate_order  # type: ignore[no-redef]
@@ -38,6 +40,8 @@ except ImportError:  # dijalankan dengan src/ di sys.path (pytest tests/)
     from trading.state import load as _load_state  # type: ignore[no-redef]
     from trading.state import save as _save_state  # type: ignore[no-redef]
     from trading.state import trip_halt as _trip_halt  # type: ignore[no-redef]
+    from trading.journal import record_close as _journal_close  # type: ignore[no-redef]
+    from trading.journal import record_open as _journal_open  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,34 @@ def _live_trading_allowed() -> tuple[bool, str]:
     if allow_live:
         return True, "live-allowed"
     return False, "live-blocked: BINANCE_TESTNET=false tanpa ALLOW_LIVE"
+
+
+def _journal_exit_price(ex_pos: dict, closed: dict) -> tuple[float, bool]:
+    """Exit price posisi yang tertutup di luar STATE.
+
+    Prioritas: markPrice (estimated=True) -> entryPrice exchange
+    (estimated=False) -> entry STATE (estimated=True, fallback basi).
+    """
+    if isinstance(ex_pos, dict):
+        for key in ("markPrice", "mark_price", "mark",
+                    "lastPrice", "last_price"):
+            try:
+                v = float(ex_pos.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v, True
+        for key in ("entryPrice", "entry_price"):
+            try:
+                v = float(ex_pos.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v, False
+    try:
+        return float((closed or {}).get("entry") or 0.0), True
+    except (TypeError, ValueError):
+        return 0.0, True
 
 
 def load_latest_gold(gold_dir: str | Path | None = None):
@@ -133,13 +165,29 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         _save_state(st, state_file)
         log.info("[%s] ADOPT posisi exchange %s qty=%s, entry baru diblokir",
                  trace_id, action_side, ex_qty)
+        try:  # jurnal tak boleh menggagalkan loop
+            _journal_open(trace_id="adopted-exchange", side=action_side,
+                          qty=float(ex_qty),
+                          entry=float(ex_pos.get("entryPrice") or 0.0),
+                          sl=None, tp=None, source="adopted-exchange")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] journal adopt gagal (%s)", trace_id, exc)
         return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
                 "reason": "adopted exchange position", "qty": 0.0}
     if ex_qty == 0 and st.get("open_position"):
+        closed = dict(st["open_position"])
         log.info("[%s] CLOSED_EXTERNALLY posisi %s hilang (SL/TP?), STATE di-clear",
-                 trace_id, st["open_position"].get("side"))
+                 trace_id, closed.get("side"))
         st["open_position"] = None
         _save_state(st, state_file)
+        try:  # jurnal tak boleh menggagalkan loop
+            exit_px, estimated = _journal_exit_price(ex_pos, closed)
+            _journal_close(trace_id=str(closed.get("trace_id") or trace_id),
+                           exit_price=exit_px, reason="sl_or_tp_unknown",
+                           fee_paid=0.0, funding_paid=0.0,
+                           estimated=estimated)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] journal close gagal (%s)", trace_id, exc)
 
     # daily pnl: eksplisit (tests) atau best-effort dari client (0.0 bila gagal)
     if daily_pnl is None:
@@ -253,6 +301,14 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                            "sl": float(sl), "tp": float(tp) if tp else None,
                            "trace_id": trace_id}
     _save_state(st, state_file)
+    try:  # jurnal tak boleh menggagalkan loop
+        setup = sig.get("setup") if isinstance(sig, dict) else None
+        _journal_open(trace_id=trace_id, side=action, qty=qty,
+                      entry=float(entry), sl=float(sl),
+                      tp=float(tp) if tp else None,
+                      source=str(setup or "unknown"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] journal open gagal (%s)", trace_id, exc)
     log.info("[%s] ORDER %s %s entry=%s sl=%s tp=%s clientOrderId=%s -> %s",
              trace_id, symbol, side, entry, sl, tp, trace_id, res)
     return {"trace_id": trace_id, "action": action, "ordered": True,
