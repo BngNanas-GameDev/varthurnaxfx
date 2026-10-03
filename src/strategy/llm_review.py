@@ -170,15 +170,25 @@ def review(signal: dict, market: dict) -> dict:
         return _confirm("bad-input", primary)
 
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    # L1: model utama, structured output.
+    # L1: model utama, structured output. Sebagian varian (mis. Fin) tidak
+    # mendukung response_format (balas kosong) -> ulangi tanpa response_format.
     try:
         text = _post(primary, api_key, _messages(prompt, False),
                      True, _timeout(deadline))
         res = _strict_parse(text)
         res["model"] = primary
         return res
-    except Exception as exc:  # noqa: BLE001 - fall through ke L2
+    except Exception as exc:  # noqa: BLE001 - fall through ke L1b
         logger.warning("llm-review L1 gagal (%s)", type(exc).__name__)
+    if deadline - time.monotonic() > 0:
+        try:
+            text = _post(primary, api_key, _messages(prompt, True),
+                         False, _timeout(deadline))
+            res = _strict_parse(text)
+            res["model"] = primary
+            return res
+        except Exception as exc:  # noqa: BLE001 - fall through ke L2
+            logger.warning("llm-review L1-plain gagal (%s)", type(exc).__name__)
     # L2: fallback sekali, tanpa response_format.
     if deadline - time.monotonic() <= 0:
         return _confirm("budget-exceeded", fallback)

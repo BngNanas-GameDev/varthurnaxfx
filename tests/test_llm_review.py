@@ -92,7 +92,7 @@ def test_malformed_json_confirms(monkeypatch, _on):
     res = llm_review.review(_sig(), _mkt())
     assert res["verdict"] == "CONFIRM"
     assert res["confidence_mult"] == 1.0
-    assert len(calls) == 2  # 1x L1 + 1x fallback, lalu CONFIRM
+    assert len(calls) == 3  # L1 rf + L1 plain + fallback, lalu CONFIRM
 
 
 def test_timeout_confirms(monkeypatch, _on):
@@ -102,7 +102,7 @@ def test_timeout_confirms(monkeypatch, _on):
                                       calls=calls))
     res = llm_review.review(_sig(), _mkt())
     assert res["verdict"] == "CONFIRM"
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_unknown_verdict_confirms(monkeypatch, _on):
