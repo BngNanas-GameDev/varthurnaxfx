@@ -94,6 +94,31 @@ def _journal_exit_price(ex_pos: dict, closed: dict) -> tuple[float, bool]:
         return 0.0, True
 
 
+def _mode_label() -> str:
+    """Label mode untuk notif: DRY_RUN / DEMO / TESTNET / LIVE."""
+    import os as _os
+
+    if _os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes"):
+        return "DRY_RUN"
+    if _os.getenv("BINANCE_DEMO", "true").lower() in ("1", "true", "yes"):
+        return "DEMO"
+    if _os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes"):
+        return "TESTNET"
+    return "LIVE"
+
+
+def _notify(message: str, trace_id: str, log) -> None:
+    """Kirim Telegram; gagal kirim tak boleh mengganggu loop."""
+    try:
+        try:
+            from src.ops.alerts import send_alert
+        except ImportError:
+            from ops.alerts import send_alert  # type: ignore[no-redef]
+        send_alert(message)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] telegram gagal (%s)", trace_id, exc)
+
+
 def load_latest_gold(gold_dir: str | Path | None = None):
     """Baca file Gold terbaru (parquet/csv) di data/gold/.
 
@@ -172,6 +197,10 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                           sl=None, tp=None, source="adopted-exchange")
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] journal adopt gagal (%s)", trace_id, exc)
+        _notify("ADOPT [%s] posisi exchange %s qty=%s entry=%s (entry baru diblokir)" % (
+            _mode_label(), action_side, ex_qty,
+            ex_pos.get("entryPrice") if isinstance(ex_pos, dict) else "?"),
+            trace_id, log)
         return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
                 "reason": "adopted exchange position", "qty": 0.0}
     if ex_qty == 0 and st.get("open_position"):
@@ -180,6 +209,8 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                  trace_id, closed.get("side"))
         st["open_position"] = None
         _save_state(st, state_file)
+        exit_px, estimated = 0.0, True
+        pnl_est = 0.0
         try:  # jurnal tak boleh menggagalkan loop
             exit_px, estimated = _journal_exit_price(ex_pos, closed)
             _journal_close(trace_id=str(closed.get("trace_id") or trace_id),
@@ -188,6 +219,17 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                            estimated=estimated)
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] journal close gagal (%s)", trace_id, exc)
+        try:
+            entry_px = float(closed.get("entry") or 0.0)
+            qty_c = float(closed.get("qty") or 0.0)
+            sign = 1.0 if str(closed.get("side", "")).upper() == "LONG" else -1.0
+            pnl_est = (exit_px - entry_px) * qty_c * sign
+        except (TypeError, ValueError):
+            pnl_est = 0.0
+        _notify("CLOSE [%s] %s qty=%s entry=%s exit=%s%s pnl_est=%+.2f USDT reason=SL/TP di exchange" % (
+            _mode_label(), closed.get("side"), closed.get("qty"),
+            closed.get("entry"), exit_px,
+            " (est)" if estimated else "", pnl_est), trace_id, log)
 
     # daily pnl: eksplisit (tests) atau best-effort dari client (0.0 bila gagal)
     if daily_pnl is None:
@@ -209,6 +251,8 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         reason = f"daily_stop:{float(daily_pnl):.4f}<={DAILY_HALT_PNL}"
         _trip_halt(reason, state_file)
         log.info("[%s] BLOCK %s, halt di-latch, tanpa order", trace_id, reason)
+        _notify("HALT [%s] %s trading dihentikan, resume manual" % (
+            _mode_label(), reason), trace_id, log)
         return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
                 "reason": reason, "qty": 0.0}
 
@@ -311,6 +355,12 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         log.warning("[%s] journal open gagal (%s)", trace_id, exc)
     log.info("[%s] ORDER %s %s entry=%s sl=%s tp=%s clientOrderId=%s -> %s",
              trace_id, symbol, side, entry, sl, tp, trace_id, res)
+    setup = sig.get("setup") if isinstance(sig, dict) else None
+    conf = sig.get("confidence") if isinstance(sig, dict) else None
+    breaker = sig.get("thesis_breaker") if isinstance(sig, dict) else None
+    _notify("ENTRY [%s] %s %s qty=%s entry=%s sl=%s tp=%s setup=%s conf=%s breaker=%s" % (
+        _mode_label(), symbol, side, qty, entry, sl, tp, setup, conf, breaker),
+        trace_id, log)
     return {"trace_id": trace_id, "action": action, "ordered": True,
             "reason": "ok", "signal": sig, "qty": qty, "side": side,
             "order": res}

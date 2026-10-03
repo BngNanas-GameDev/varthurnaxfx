@@ -170,3 +170,42 @@ def test_exchange_flat_clears_stale_state(client, state_file):
     # STATE basi di-clear lalu sinyal LONG dieksekusi normal
     assert res["ordered"] is True
     assert load(state_file)["open_position"]["trace_id"] == res["trace_id"]
+
+
+def test_entry_sends_telegram(client, state_file, monkeypatch):
+    import src.ops.alerts as alerts_mod
+
+    sent = []
+    monkeypatch.setattr(alerts_mod, "send_alert", lambda m: sent.append(m) or True)
+    res = trading_loop.run_cycle(client, 1000.0, df=make_long_gold(),
+                                 state_file=state_file)
+    assert res["ordered"] is True
+    assert len(sent) == 1
+    assert sent[0].startswith("ENTRY")
+    assert "BUY" in sent[0] and "sl=" in sent[0] and "breaker=" in sent[0]
+
+
+def test_close_sends_telegram(client, state_file, monkeypatch):
+    import src.ops.alerts as alerts_mod
+
+    sent = []
+    monkeypatch.setattr(alerts_mod, "send_alert", lambda m: sent.append(m) or True)
+    set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
+                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
+                 state_file)
+    client.get_position.return_value = {"contracts": 0.0,
+                                        "markPrice": 60500.0}
+    trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),
+                           state_file=state_file)
+    assert any(s.startswith("CLOSE") for s in sent)
+    assert any("pnl_est=" in s for s in sent)
+
+
+def test_no_trade_sends_nothing(client, state_file, monkeypatch):
+    import src.ops.alerts as alerts_mod
+
+    sent = []
+    monkeypatch.setattr(alerts_mod, "send_alert", lambda m: sent.append(m) or True)
+    trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),
+                           state_file=state_file)
+    assert sent == []
