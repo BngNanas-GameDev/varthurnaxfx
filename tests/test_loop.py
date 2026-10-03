@@ -23,6 +23,7 @@ def state_file(tmp_path):
 def client():
     m = MagicMock()
     m.get_daily_pnl.return_value = 0.0
+    m.get_position.return_value = {"contracts": 0.0}
     m.place_entry.return_value = {"clientOrderId": "x", "status": "filled"}
     return m
 
@@ -117,6 +118,8 @@ def test_open_position_blocks_double_entry(client, state_file):
     set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
                   "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
                  state_file)
+    client.get_position.return_value = {"contracts": 0.03, "side": "long",
+                                        "entryPrice": 60000.0}
     res = trading_loop.run_cycle(client, 1000.0, df=make_long_gold(),
                                  state_file=state_file)
     assert res["ordered"] is False
@@ -144,3 +147,26 @@ def test_daily_stop_blocks_and_latches(client, state_file):
     assert load(state_file)["halt_latched"] is True
     client.place_entry.assert_not_called()
     clear_position(state_file)  # hygiene, no-op bila None
+
+
+def test_adopt_exchange_position_blocks_entry(client, state_file):
+    client.get_position.return_value = {"contracts": 0.001, "side": "long",
+                                        "entryPrice": 84000.0}
+    res = trading_loop.run_cycle(client, 1000.0, df=make_long_gold(),
+                                 state_file=state_file)
+    assert res["ordered"] is False
+    assert "adopted" in res["reason"]
+    assert load(state_file)["open_position"]["trace_id"] == "adopted-exchange"
+    client.place_entry.assert_not_called()
+
+
+def test_exchange_flat_clears_stale_state(client, state_file):
+    set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
+                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
+                 state_file)
+    client.get_position.return_value = {"contracts": 0.0}
+    res = trading_loop.run_cycle(client, 1000.0, df=make_long_gold(),
+                                 state_file=state_file)
+    # STATE basi di-clear lalu sinyal LONG dieksekusi normal
+    assert res["ordered"] is True
+    assert load(state_file)["open_position"]["trace_id"] == res["trace_id"]

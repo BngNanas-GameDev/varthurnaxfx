@@ -35,6 +35,11 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
     ws_connected = False  # set True once a real WS callback delivers messages
     rest_mode_logged = False
     halt_latched = False
+    last_refresh_ts = 0.0
+    try:
+        refresh_every = float(os.getenv("REFRESH_S", "300"))
+    except ValueError:
+        refresh_every = 300.0
     it = 0
     logger.info("daemon start poll=%.1fs ws_stale=%.0fs dry_run=%s",
                 poll_interval, WS_STALE_S, client.dry_run)
@@ -67,6 +72,16 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
                 # Strategy paper-trading (testnet). Error di sini tak boleh
                 # mematikan daemon: tangkap, log, lanjut iterasi.
                 try:
+                    if time.time() - last_refresh_ts >= refresh_every:
+                        try:
+                            try:
+                                from src.data.refresh import refresh_gold
+                            except ImportError:
+                                from data.refresh import refresh_gold  # noqa: E402
+                            if refresh_gold() is not None:
+                                last_refresh_ts = time.time()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("refresh Gold gagal (%s), pakai Gold lama", exc)
                     try:
                         from src.trading.loop import run_cycle
                     except ImportError:

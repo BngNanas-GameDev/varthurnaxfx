@@ -113,6 +113,34 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
 
     st = _load_state(state_file)
 
+    # Rekonsiliasi dengan posisi exchange (anti double-entry):
+    # - exchange ada posisi tapi STATE kosong -> adopsi, blokir entry baru.
+    # - STATE ada posisi tapi exchange flat -> anggap SL/TP kena, clear.
+    try:
+        ex_pos = client.get_position()
+        ex_qty = abs(float(ex_pos.get("contracts") or 0.0))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] get_position gagal (%s), pakai STATE saja", trace_id, exc)
+        ex_qty, ex_pos = 0.0, {}
+    if ex_qty > 0 and not st.get("open_position"):
+        side = str(ex_pos.get("side", "")).lower()
+        action_side = "LONG" if side == "long" else "SHORT"
+        st["open_position"] = {"side": action_side, "qty": float(ex_qty),
+                               "entry": float(ex_pos.get("entryPrice") or 0.0),
+                               "sl": None, "tp": None,
+                               "trace_id": "adopted-exchange",
+                               "adopted": True}
+        _save_state(st, state_file)
+        log.info("[%s] ADOPT posisi exchange %s qty=%s, entry baru diblokir",
+                 trace_id, action_side, ex_qty)
+        return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
+                "reason": "adopted exchange position", "qty": 0.0}
+    if ex_qty == 0 and st.get("open_position"):
+        log.info("[%s] CLOSED_EXTERNALLY posisi %s hilang (SL/TP?), STATE di-clear",
+                 trace_id, st["open_position"].get("side"))
+        st["open_position"] = None
+        _save_state(st, state_file)
+
     # daily pnl: eksplisit (tests) atau best-effort dari client (0.0 bila gagal)
     if daily_pnl is None:
         try:
