@@ -96,6 +96,14 @@ def check(name: str, ok: bool, detail: str) -> None:
 def check_env_file() -> dict[str, str]:
     print("--- (a) .env presence & required vars (secrets: length only) ---")
     if not ENV_FILE.exists():
+        # Di dalam container .env tidak ada sebagai file (env_file di-inject
+        # sebagai environment). Terima bila var wajib ada di environment.
+        injected = {k: os.getenv(k, "") for k in ("BINANCE_API_KEY", "BINANCE_API_SECRET")}
+        if all(injected.values()):
+            check("env-file", True, ".env file absent but vars injected via container env")
+            for key in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
+                check("env-%s" % key, True, _describe(key, injected[key]))
+            return injected
         check("env-file", False, ".env NOT FOUND at repo root (copy from .env.example)")
         return {}
     file_vars = _parse_dotenv(ENV_FILE)
