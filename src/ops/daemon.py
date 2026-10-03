@@ -31,6 +31,21 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
     from src.ops.alerts import send_alert
 
     client = BinanceClient()  # reads DRY_RUN / testnet env internally
+    # WS realtime feed (public, no key). Fail-closed: gagal init -> None,
+    # ws_connected tetap False -> REST polling seperti sebelumnya.
+    feed = None
+    try:
+        _ws_enabled = os.getenv("WS_ENABLED", "true").lower() in ("1", "true", "yes")
+    except Exception:  # noqa: BLE001
+        _ws_enabled = True
+    if _ws_enabled:
+        try:
+            from src.data.ws_feed import MiniFeed
+            feed = MiniFeed()
+            feed.connect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WS feed init gagal (%s), pakai REST", exc)
+            feed = None
     last_ws_msg_ts = time.time()
     ws_connected = False  # set True once a real WS callback delivers messages
     rest_mode_logged = False
@@ -46,6 +61,17 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
     while True:
         try:
             daily_pnl = client.get_daily_pnl()
+            # WS feed realtime: sinkronkan status koneksi dari MiniFeed.
+            # Fail-closed: healthy()=False -> ws_connected False -> REST fallback.
+            if feed is not None:
+                try:
+                    if feed.healthy():
+                        ws_connected = True
+                        last_ws_msg_ts = feed.last_msg_ts
+                    else:
+                        ws_connected = False
+                except Exception:  # noqa: BLE001
+                    ws_connected = False
             # WS-stale check: in full implementation last_ws_msg_ts is updated
             # by the websocket callback; here we treat >10s without update
             # as stale and force a REST fallback read.

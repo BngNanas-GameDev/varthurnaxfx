@@ -80,3 +80,36 @@ python -m py_compile scripts/tune_params.py
 
 File diubah/ditambah: `scripts/tune_params.py` (baru), `TUNING.md` (baru).
 `src/strategy/setups.py` SENGAJA tidak diubah. Data `data/bronze/*` tidak di-commit.
+
+## Follow-up worker-1: filter regime anti-loss (NEGATIF — ditolak, setups.py di-revert)
+
+- Mekanisme yang diuji (aditif, di `setups.py`, sudah di-revert): konstanta
+  `REGIME_EMA_SLOPE_LOOKBACK=10`, `REGIME_EMA_SLOPE_PCT=0.0015` (0.15%/10 bar),
+  `REGIME_TREND_ATR_MULT=2.0`, `REGIME_ATR_MEDIAN_LOOKBACK=50`,
+  `REGIME_STORM_LOOKBACK=100`, `REGIME_STORM_PCTILE=90`. Aturan: trend kuat
+  (`|slope EMA50/10bar|>0.15%` ATAU `|close-EMA50|/EMA50 > 2*atr_pct`) memblokir
+  sinyal MR berlawanan arah; ATR% di atas P90 100 bar memblokir SEMUA entry baru
+  (volatility storm). Fail-open bila histori kurang. Breakout searah trend tetap
+  boleh jalan. Skrip ad-hoc (di luar repo, tidak di-commit): filter on vs
+  monkeypatch-off pada split 70/30 yang SAMA (IS 700 / OOS 300 bar).
+- Hasil (fee/slippage/dll identik dengan eksperimen utama):
+
+| split | baseline trades | baseline net | baseline dd | +filter trades | +filter net | +filter dd |
+|-------|----------------|--------------|-------------|----------------|-------------|------------|
+| IS    | 34 | -1779.66 | -0.1904 | 28 | -997.61 | -0.1237 |
+| OOS   | 12 | -766.39 | -0.0766 | 12 | -697.92 | -0.0870 |
+
+- OOS breakdown +filter: MR 6 SL / 1 TP / 1 timeout + breakout 3 SL / 1 TP
+  (baseline OOS: 12/12 MR, 0 breakout — filter menggeser jendela posisi
+  non-overlapping sehingga breakout ikut fire, 3 di antaranya SL).
+- Kriteria terima worker-1: OOS trades ≥ 6 (terpenuhi: 12) DAN net membaik ≥20%
+  (butuh ≥ -613.11; aktual -697.92 = +8.9% → GAGAL) ATAU dd membaik ≥20% tanpa
+  net memburuk (dd -0.0766 → -0.0870 = -13.6%, net juga tidak lolos → GAGAL).
+- Keputusan: TOLAK. `src/strategy/setups.py` di-revert ke HEAD (tidak ada diff),
+  tidak di-commit. Verifikasi pasca-revert: `pytest tests -q` 36 passed,
+  `py_compile` setups.py + tune_params.py OK.
+- Pelajaran: filter trend benar memangkas MR yang kalah di IS (34→28 trade,
+  net IS +44%) tapi tidak mentransfer ke OOS (+8.9% net, dd malah memburuk);
+  signal-timing backtest non-overlapping membuat pemblokiran menggeser trade
+  berikutnya (breakout SL ikut masuk). Hipotesis "MR kalah saat trend kuat"
+  belum terbukti dengan ambang ini — jangan naikkan ambang/grid tanpa data baru.

@@ -281,6 +281,48 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         return {"trace_id": trace_id, "action": action, "ordered": False,
                 "reason": str(sig.get("reason", "no-trade")), "signal": sig, "qty": 0.0}
 
+    # LLM second-opinion: VETO ONLY, fail-closed, default OFF.
+    # OFF -> nol network call, perilaku identik seperti sebelumnya.
+    if os.getenv("LLM_REVIEW", "false").lower() in ("1", "true", "yes"):
+        try:
+            try:
+                from src.strategy.llm_review import review as _llm_review
+            except ImportError:
+                from strategy.llm_review import review as _llm_review  # type: ignore[no-redef]
+            _mkt_last = gold.iloc[-1]
+            _mkt = {"symbol": symbol,
+                    "atr_pct": (float(sig.get("atr") or 0.0)
+                                / float(sig.get("entry") or 0.0))
+                    if float(sig.get("entry") or 0.0) > 0 else 0.0,
+                    "funding": float(sig.get("funding_rate") or 0.0),
+                    "rsi": float(_mkt_last.get("rsi14") or 0.0),
+                    "closes": [float(x) for x in gold["close"].iloc[-5:].tolist()]}
+            _rev = _llm_review(sig, _mkt)
+            if not isinstance(_rev, dict):
+                raise ValueError("review non-dict")
+            _raw_mult = _rev.get("confidence_mult", 1.0)
+            _mult = min(max(float(_raw_mult if _raw_mult is not None else 1.0),
+                            0.0), 1.0)
+            if str(_rev.get("verdict", "CONFIRM")).upper() == "VETO":
+                _save_state(st, state_file)
+                _reason = "llm-veto: %s" % (_rev.get("reason") or "vetoed")
+                log.info("[%s] VETO %s %s (%s), tanpa order",
+                         trace_id, symbol, action, _reason)
+                _notify("VETO [%s] %s %s dibatalkan (%s)" % (
+                    _mode_label(), symbol, action, _reason), trace_id, log)
+                return {"trace_id": trace_id, "action": "NO_TRADE",
+                        "ordered": False, "reason": _reason,
+                        "signal": sig, "qty": 0.0}
+            if _mult < 1.0:  # hanya boleh menurunkan, tak pernah menaikkan
+                try:
+                    _conf = float(sig.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    _conf = 0.0
+                sig = dict(sig, confidence=min(_conf, _conf * _mult))
+        except Exception as exc:  # noqa: BLE001 - fail-closed: rule-based jalan
+            log.warning("[%s] llm-review gagal (%s), lanjut rule-based",
+                        trace_id, exc)
+
     # 1 posisi 1 arah: posisi open apa pun memblokir entry baru
     pos = st.get("open_position")
     if pos:
