@@ -9,6 +9,7 @@ Schema:
   "halt_reason": str,
   "last_signal_ts": str|None,  # ISO-8601 evaluasi sinyal terakhir
   "arbitration": dict|None,   # cache putusan arbiter per bar {bar, pick, ...}
+  "review_cache": dict|None,  # cache verdict review per bar+sinyal
   "updated_at": str|None,
 }
 
@@ -46,6 +47,7 @@ def default_state() -> dict:
         "halt_reason": "",
         "last_signal_ts": None,
         "arbitration": None,
+        "review_cache": None,
         "updated_at": None,
     }
 

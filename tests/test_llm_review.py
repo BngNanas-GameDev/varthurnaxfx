@@ -146,6 +146,56 @@ def test_loop_conflict_dedup_per_bar(monkeypatch, tmp_path):
     assert len(calls) == 1  # hanya siklus pertama yang HTTP (bar sama)
 
 
+def test_loop_review_dedup_per_bar(monkeypatch, tmp_path):
+    import src.ops.alerts as alerts_mod
+
+    monkeypatch.setenv("LLM_REVIEW", "true")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    calls = []
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        _fake_urlopen('{"verdict":"CONFIRM",'
+                                      '"confidence_mult":1.0,"reason":"ok"}',
+                                      calls=calls))
+    monkeypatch.setattr(alerts_mod, "send_alert", lambda m: True)
+    m = MagicMock()
+    m.get_daily_pnl.return_value = 0.0
+    m.get_position.return_value = {"contracts": 0.0}
+    m.place_entry.return_value = {"clientOrderId": "x"}
+    sf = str(tmp_path / "st.json")
+    df = make_long_gold()
+    r1 = trading_loop.run_cycle(m, 1000.0, df=df, state_file=sf)
+    r2 = trading_loop.run_cycle(m, 1000.0, df=df, state_file=sf)
+    assert r1["ordered"] is True and r2["ordered"] is True
+    assert len(calls) == 1  # review kedua dari cache
+
+
+def test_loop_arbiter_pick_enriched(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_REVIEW", "true")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    seen = {}
+
+    def _fake(req, timeout=None):
+        import json as _json
+        seen["n"] = seen.get("n", 0) + 1
+        if seen["n"] == 1:
+            body = '{"pick":"LONG","confidence_mult":1.0,"reason":"trend"}'
+        else:
+            body = '{"verdict":"CONFIRM","confidence_mult":1.0,"reason":"ok"}'
+        return _FakeResp(_wrap(body))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    monkeypatch.setattr(trading_loop, "evaluate", lambda df: _conflict())
+    m = MagicMock()
+    m.get_daily_pnl.return_value = 0.0
+    m.get_position.return_value = {"contracts": 0.0}
+    m.place_entry.return_value = {"clientOrderId": "x"}
+    sf = str(tmp_path / "st.json")
+    res = trading_loop.run_cycle(m, 1000.0, df=make_long_gold(), state_file=sf)
+    # sinyal arbiter punya atr+funding (tak lagi 0.0 -> review tak veto bogus)
+    assert res["ordered"] is True, res
+    assert seen["n"] == 2  # 1 arbitrase + 1 review
+
+
 def _mkt():
     return {"symbol": "BTCUSDT-PERP", "atr_pct": 0.003, "funding": 0.0,
             "rsi": 55.0, "closes": [59900.0, 59950.0, 59980.0, 59990.0, 60000.0]}
