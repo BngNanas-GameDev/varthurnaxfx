@@ -217,6 +217,56 @@ class BinanceClient:
             logger.warning("idempotency lookup failed: %s", exc)
         return None
 
+    def fetch_realized(self, symbol: str = SYMBOL, since_ms: int | None = None) -> dict:
+        """Realized PnL + fee + funding riil dari income history Binance.
+
+        Sumber kebenaran untuk notif CLOSE (markPrice tak ada saat posisi
+        sudah flat, sehingga exit price harus diambil dari eksekusi nyata).
+        Return {} bila gagal/tidak tersedia (DRY_RUN atau tanpa key).
+        """
+        out = {"realized_pnl": None, "fee": None, "funding": None,
+               "exit_price": None, "exit_ts": None}
+        if self.dry_run or self._exchange is None:
+            return out
+        try:
+            params: dict[str, Any] = {"symbol": symbol}
+            if since_ms:
+                params["startTime"] = int(since_ms)
+            rows = self._call_with_retry("fetch_income", params) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_realized gagal: %s", exc)
+            return out
+        realized = fee = funding = 0.0
+        for r in rows:
+            info = r.get("info", {}) if isinstance(r, dict) else {}
+            i_type = str(info.get("incomeType") or r.get("type") or "")
+            amt = r.get("amount", info.get("income"))
+            try:
+                amt = float(amt)
+            except (TypeError, ValueError):
+                continue
+            if i_type == "REALIZED_PNL":
+                realized += amt
+            elif i_type == "COMMISSION":
+                fee = abs(fee) + abs(amt)   # Binance tulis fee negatif
+            elif i_type == "FUNDING_FEE":
+                funding += amt             # funding: +ekspsi, -dibayar
+        exit_price = None
+        exit_ts = None
+        # exit price: trade terakhir dari window (harga eksekusi nyata)
+        try:
+            trades = self._call_with_retry(
+                "fetch_my_trades", symbol, since_ms) or []
+            if trades:
+                last = trades[-1]
+                exit_price = float(last.get("price") or 0.0) or None
+                exit_ts = last.get("timestamp")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_my_trades gagal: %s", exc)
+        out.update({"realized_pnl": realized, "fee": fee, "funding": funding,
+                    "exit_price": exit_price, "exit_ts": exit_ts})
+        return out
+
     def cancel_all(self, symbol: str = SYMBOL) -> dict:
         if self.dry_run:
             logger.info("[DRY_RUN] cancel_all %s", symbol)

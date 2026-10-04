@@ -148,8 +148,11 @@ def test_loop_closed_externally_hook_records_close(client, state_file, jfile):
     set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
                   "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
                  state_file)
-    client.get_position.return_value = {"contracts": 0.0,
-                                        "markPrice": 60500.0}
+    client.get_position.return_value = {"contracts": 0.0}
+    client.fetch_realized.return_value = {
+        "realized_pnl": 150.0, "fee": 0.9, "funding": 0.1,
+        "exit_price": 60500.0, "exit_ts": 1_700_000_000_000,
+    }
     res = trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),
                                  state_file=state_file)
     assert res["ordered"] is False
@@ -158,6 +161,32 @@ def test_loop_closed_externally_hook_records_close(client, state_file, jfile):
     closes = [r for r in lines if r.get("event") == "close"
               and r.get("trace_id") == "prev"]
     assert len(closes) == 1
-    assert closes[0]["reason"] == "sl_or_tp_unknown"
+    # exit 60500 bukan SL(59700) bukan juga TP(60600) -> manual/unknown
+    assert closes[0]["reason"] == "manual/unknown", closes[0]
     assert closes[0]["exit_price"] == pytest.approx(60500.0)
+    assert closes[0]["estimated"] is False
+    assert closes[0]["fee_paid"] == pytest.approx(0.9)
+    assert closes[0]["funding_paid"] == pytest.approx(0.1)
+
+
+def test_loop_close_fallback_sl_when_exchange_unavailable(client, state_file, jfile):
+    """Tanpa income history: exitprice dicurigai dari level STATE (SL/TP)."""
+    set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
+                  "sl": 59700.0, "tp": 60600.0, "trace_id": "fb"},
+                 state_file)
+    client.get_position.return_value = {"contracts": 0.0}
+    client.fetch_realized.return_value = {
+        "realized_pnl": None, "fee": None, "funding": None,
+        "exit_price": None, "exit_ts": None,
+    }
+    res = trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),
+                                 state_file=state_file)
+    assert res["ordered"] is False
+    lines = [json.loads(line) for line in Path(jfile).read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    closes = [r for r in lines if r.get("event") == "close"
+              and r.get("trace_id") == "fb"]
+    assert len(closes) == 1
     assert closes[0]["estimated"] is True
+    assert closes[0]["exit_price"] in (59700.0, 60600.0)
+    assert closes[0]["reason"] in ("stop-loss", "take-profit")

@@ -190,15 +190,23 @@ def test_close_sends_telegram(client, state_file, monkeypatch):
 
     sent = []
     monkeypatch.setattr(alerts_mod, "send_alert", lambda m: sent.append(m) or True)
+    # realized PnL riil dari exchange: +150 gross, -0.45 fee
+    client.fetch_realized.return_value = {
+        "realized_pnl": 150.0, "fee": 0.45, "funding": 0.0,
+        "exit_price": 60500.0, "exit_ts": 1_700_000_000_000,
+    }
     set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
                   "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
                  state_file)
-    client.get_position.return_value = {"contracts": 0.0,
-                                        "markPrice": 60500.0}
+    client.get_position.return_value = {"contracts": 0.0}
     trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),
                            state_file=state_file)
-    assert any(s.startswith("CLOSE") for s in sent)
-    assert any("pnl_est=" in s for s in sent)
+    closes = [s for s in sent if s.startswith("CLOSE")]
+    assert len(closes) == 1, sent
+    assert "PnL +150.00 USDT" in closes[0], closes[0]
+    assert "fee 0.45" in closes[0] and "net +149.55" in closes[0], closes[0]
+    assert "exit=60500.0" in closes[0]
+    assert "(est)" not in closes[0]  # dari exchange nyata
 
 
 def test_no_trade_sends_nothing(client, state_file, monkeypatch):

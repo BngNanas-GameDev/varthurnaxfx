@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -66,32 +67,101 @@ def _live_trading_allowed() -> tuple[bool, str]:
     return False, "live-blocked: BINANCE_TESTNET=false tanpa ALLOW_LIVE"
 
 
-def _journal_exit_price(ex_pos: dict, closed: dict) -> tuple[float, bool]:
-    """Exit price posisi yang tertutup di luar STATE.
+def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
+    """Exit price + PnL riil untuk posisi yang tertutup di luar STATE.
 
-    Prioritas: markPrice (estimated=True) -> entryPrice exchange
-    (estimated=False) -> entry STATE (estimated=True, fallback basi).
+    Prioritas (fallback beruntun, semua di-try/except):
+      1. income history exchange -> realized_pnl/fee/funding (sumber kebenaran)
+      2. fetch_my_trades -> exit price eksekusi nyata
+      3. markPrice di ex_pos (jarang ada: posisi sudah flat)
+      4. hitung dari (entry, sl, tp) -> exit = sl atau tp mana yang realistis
+
+    Return dict {exit_price, pnl, fee, funding, estimated, reason}.
+    estimated=False bila berasal dari data exchange nyata.
     """
-    if isinstance(ex_pos, dict):
-        for key in ("markPrice", "mark_price", "mark",
-                    "lastPrice", "last_price"):
-            try:
-                v = float(ex_pos.get(key) or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if v > 0:
-                return v, True
-        for key in ("entryPrice", "entry_price"):
-            try:
-                v = float(ex_pos.get(key) or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if v > 0:
-                return v, False
+    side = str((closed or {}).get("side", "")).upper()
+    sign = 1.0 if side == "LONG" else -1.0
     try:
-        return float((closed or {}).get("entry") or 0.0), True
+        entry_px = float((closed or {}).get("entry") or 0.0)
+        qty_c = float((closed or {}).get("qty") or 0.0)
+        sl = float((closed or {}).get("sl") or 0.0)
+        tp = float((closed or {}).get("tp") or 0.0)
     except (TypeError, ValueError):
-        return 0.0, True
+        entry_px = qty_c = sl = tp = 0.0
+    out = {"exit_price": 0.0, "pnl": 0.0, "fee": 0.0, "funding": 0.0,
+           "estimated": True, "reason": "unknown"}
+
+    # 1+2. exchange: realized pnl + exit price nyata
+    try:
+        rz = client.fetch_realized(since_ms=_opened_ms(closed))
+    except Exception:  # noqa: BLE001
+        rz = {}
+    if isinstance(rz, dict) and rz.get("realized_pnl") is not None:
+        try:
+            out["pnl"] = float(rz.get("realized_pnl") or 0.0)
+            out["fee"] = abs(float(rz.get("fee") or 0.0))
+            out["funding"] = float(rz.get("funding") or 0.0)  # +ekspsi, -dibayar
+            out["estimated"] = False
+            out["reason"] = "realized"
+        except (TypeError, ValueError):
+            pass
+        try:
+            ep = float(rz.get("exit_price") or 0.0)
+        except (TypeError, ValueError):
+            ep = 0.0
+        if ep > 0:
+            out["exit_price"] = ep
+            out["reason"] = _classify_exit(side, ep, entry_px, sl, tp)
+            return out
+
+    # 3. markPrice (fallback)
+    exit_px = 0.0
+    if isinstance(ex_pos, dict):
+        for key in ("markPrice", "mark_price", "mark", "lastPrice", "last_price"):
+            try:
+                v = float(ex_pos.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                exit_px = v
+                break
+    if exit_px <= 0:
+        # 4. exit_price tak diketahui -> pakai SL atau TP yang tercatat
+        exit_px = sl if sl > 0 else tp
+        out["estimated"] = True
+    if exit_px <= 0:
+        exit_px = entry_px
+    out["exit_price"] = exit_px
+    out["reason"] = _classify_exit(side, exit_px, entry_px, sl, tp)
+    if not (isinstance(rz, dict) and rz.get("realized_pnl") is not None):
+        out["pnl"] = (exit_px - entry_px) * qty_c * sign
+    return out
+
+
+def _classify_exit(side: str, exit_px: float, entry_px: float,
+                   sl: float, tp: float) -> str:
+    """Tentukan SL / TP / unknown dari harga exit vs level di STATE."""
+    if exit_px <= 0:
+        return "unknown"
+    tol = max(entry_px * 0.0005, 1e-9)
+    if sl > 0 and (abs(exit_px - sl) <= tol or
+                   (side == "LONG" and exit_px <= sl) or
+                   (side == "SHORT" and exit_px >= sl)):
+        return "stop-loss"
+    if tp > 0 and (abs(exit_px - tp) <= tol or
+                   (side == "LONG" and exit_px >= tp) or
+                   (side == "SHORT" and exit_px <= tp)):
+        return "take-profit"
+    return "manual/unknown"
+
+
+def _opened_ms(closed: dict) -> int | None:
+    """Timestamp ms buka posisi dari STATE (dipakai fetch_realized since)."""
+    try:
+        ts = (closed or {}).get("opened_ts")
+        return int(ts) if ts else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _mode_label() -> str:
@@ -186,7 +256,8 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                                "entry": float(ex_pos.get("entryPrice") or 0.0),
                                "sl": None, "tp": None,
                                "trace_id": "adopted-exchange",
-                               "adopted": True}
+                               "adopted": True,
+                               "opened_ts": int(time.time() * 1000)}
         _save_state(st, state_file)
         log.info("[%s] ADOPT posisi exchange %s qty=%s, entry baru diblokir",
                  trace_id, action_side, ex_qty)
@@ -209,27 +280,34 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
                  trace_id, closed.get("side"))
         st["open_position"] = None
         _save_state(st, state_file)
-        exit_px, estimated = 0.0, True
-        pnl_est = 0.0
+        try:  # exit + PnL riil dari exchange; semua fallback di-_resolve_exit
+            ex = _resolve_exit(client, closed, ex_pos)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] resolve exit gagal (%s), fallback STATE", trace_id, exc)
+            ex = {"exit_price": 0.0, "pnl": 0.0, "fee": 0.0, "funding": 0.0,
+                  "estimated": True, "reason": "unknown"}
+        exit_px = float(ex.get("exit_price") or 0.0)
+        pnl = float(ex.get("pnl") or 0.0)
+        fee = float(ex.get("fee") or 0.0)
+        funding = float(ex.get("funding") or 0.0)
+        estimated = bool(ex.get("estimated", True))
+        reason = str(ex.get("reason") or "unknown")
         try:  # jurnal tak boleh menggagalkan loop
-            exit_px, estimated = _journal_exit_price(ex_pos, closed)
             _journal_close(trace_id=str(closed.get("trace_id") or trace_id),
-                           exit_price=exit_px, reason="sl_or_tp_unknown",
-                           fee_paid=0.0, funding_paid=0.0,
+                           exit_price=exit_px, reason=reason,
+                           fee_paid=fee, funding_paid=funding,
                            estimated=estimated)
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] journal close gagal (%s)", trace_id, exc)
-        try:
-            entry_px = float(closed.get("entry") or 0.0)
-            qty_c = float(closed.get("qty") or 0.0)
-            sign = 1.0 if str(closed.get("side", "")).upper() == "LONG" else -1.0
-            pnl_est = (exit_px - entry_px) * qty_c * sign
-        except (TypeError, ValueError):
-            pnl_est = 0.0
-        _notify("CLOSE [%s] %s qty=%s entry=%s exit=%s%s pnl_est=%+.2f USDT reason=SL/TP di exchange" % (
-            _mode_label(), closed.get("side"), closed.get("qty"),
-            closed.get("entry"), exit_px,
-            " (est)" if estimated else "", pnl_est), trace_id, log)
+        net = pnl - fee + funding
+        _notify(
+            "CLOSE [%s] %s qty=%s entry=%s exit=%s%s | PnL %+.2f USDT "
+            "(gross %+.2f fee %.2f funding %+.2f net %+.2f) | %s"
+            % (_mode_label(), closed.get("side"), closed.get("qty"),
+               closed.get("entry"), exit_px, " (est)" if estimated else "",
+               pnl, pnl, fee, funding, net, reason), trace_id, log)
+        log.info("[%s] CLOSE realized pnl=%.4f fee=%.4f funding=%.4f net=%.4f exit=%.2f reason=%s",
+                 trace_id, pnl, fee, funding, net, exit_px, reason)
 
     # daily pnl: eksplisit (tests) atau best-effort dari client (0.0 bila gagal)
     if daily_pnl is None:
@@ -510,7 +588,8 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
 
     st["open_position"] = {"side": action, "qty": qty, "entry": float(entry),
                            "sl": float(sl), "tp": float(tp) if tp else None,
-                           "trace_id": trace_id}
+                           "trace_id": trace_id,
+                           "opened_ts": int(time.time() * 1000)}
     _save_state(st, state_file)
     try:  # jurnal tak boleh menggagalkan loop
         setup = sig.get("setup") if isinstance(sig, dict) else None
