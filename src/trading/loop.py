@@ -274,12 +274,98 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
     action = str(sig.get("action", "NO_TRADE")).upper()
     st["last_signal_ts"] = _now_iso()
 
+    # Arbiter konflik: LONG vs SHORT bersamaan -> Fin memilih satu sisi
+    # (atau menolak keduanya). Dedup per bar agar tak panggil LLM tiap 5 detik.
+    # LLM OFF / gagal / NEITHER -> tetap NO_TRADE seperti sebelumnya.
     if action not in ("LONG", "SHORT"):
-        _save_state(st, state_file)
-        log.info("[%s] NO_TRADE (%s: %s), tanpa order", trace_id,
-                 action, sig.get("reason", sig.get("thesis", "")))
-        return {"trace_id": trace_id, "action": action, "ordered": False,
-                "reason": str(sig.get("reason", "no-trade")), "signal": sig, "qty": 0.0}
+        _cands = sig.get("candidates") or []
+        _sides: dict = {}
+        for _c in _cands:
+            _a = str((_c or {}).get("action", "")).upper()
+            if _a in ("LONG", "SHORT") and _a not in _sides:
+                _sides[_a] = _c
+        if (len(_sides) == 2 and os.getenv("LLM_REVIEW", "false").lower()
+                in ("1", "true", "yes")):
+            try:
+                _bar_ts = int(gold.iloc[-1]["open_time"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                _bar_ts = 0
+            _arb_cache = st.get("arbitration") or {}
+            if _arb_cache.get("bar") == _bar_ts and _arb_cache.get("pick") in (
+                    "LONG", "SHORT", "NEITHER"):
+                _cached = _arb_cache.get("pick")
+                if _cached == "NEITHER":
+                    log.info("[%s] ARBITER cache bar=%s NEITHER (tanpa HTTP), tanpa order",
+                             trace_id, _bar_ts)
+                    return {"trace_id": trace_id, "action": "NO_TRADE",
+                            "ordered": False,
+                            "reason": "arbiter-neither: %s" % (_arb_cache.get("reason") or ""),
+                            "signal": sig, "qty": 0.0}
+                sig = dict(_arb_cache["signal"])
+                action = _cached
+                log.info("[%s] ARBITER cache bar=%s pick=%s (tanpa HTTP)",
+                         trace_id, _bar_ts, action)
+            else:
+                try:
+                    try:
+                        from src.strategy.llm_review import arbitrate as _arbitrate
+                    except ImportError:
+                        from strategy.llm_review import arbitrate as _arbitrate  # type: ignore[no-redef]
+                    _mkt_last = gold.iloc[-1]
+                    _mkt = {"symbol": symbol,
+                            "atr_pct": (float(_mkt_last.get("atr14") or 0.0)
+                                        / float(_mkt_last.get("close") or 0.0))
+                            if float(_mkt_last.get("close") or 0.0) > 0 else 0.0,
+                            "funding": float(_mkt_last.get("funding_rate") or 0.0),
+                            "rsi": float(_mkt_last.get("rsi14") or 0.0),
+                            "closes": [float(x) for x in gold["close"].iloc[-5:].tolist()]}
+                    _res = _arbitrate(_sides["LONG"], _sides["SHORT"], _mkt)
+                    if not isinstance(_res, dict):
+                        raise ValueError("arbitrate non-dict")
+                    _pick = str(_res.get("pick", "NEITHER")).upper()
+                    if _pick in ("LONG", "SHORT"):
+                        sig = dict(_sides[_pick])
+                        try:
+                            _m0 = float(sig.get("confidence") or 0.0)
+                        except (TypeError, ValueError):
+                            _m0 = 0.0
+                        try:
+                            _mm = min(max(float(_res.get("confidence_mult", 1.0)), 0.0), 1.0)
+                        except (TypeError, ValueError):
+                            _mm = 1.0
+                        sig["confidence"] = min(_m0, _m0 * _mm)
+                        action = _pick
+                        st["arbitration"] = {"bar": _bar_ts, "pick": _pick,
+                                             "signal": sig,
+                                             "reason": str(_res.get("reason") or "")}
+                        _save_state(st, state_file)
+                        log.info("[%s] ARBITER bar=%s pick=%s (%s)",
+                                 trace_id, _bar_ts, _pick, _res.get("reason"))
+                        _notify("ARBITER [%s] konflik diputus: %s (%s)" % (
+                            _mode_label(), _pick, _res.get("reason")), trace_id, log)
+                    else:
+                        st["arbitration"] = {"bar": _bar_ts, "pick": "NEITHER",
+                                             "reason": str(_res.get("reason") or "")}
+                        _save_state(st, state_file)
+                        log.info("[%s] ARBITER bar=%s NEITHER (%s), tanpa order",
+                                 trace_id, _bar_ts, _res.get("reason"))
+                        return {"trace_id": trace_id, "action": "NO_TRADE",
+                                "ordered": False,
+                                "reason": "arbiter-neither: %s" % (_res.get("reason") or ""),
+                                "signal": sig, "qty": 0.0}
+                except Exception as exc:  # noqa: BLE001 - fail-closed: NO_TRADE
+                    log.warning("[%s] arbiter gagal (%s), tetap NO_TRADE",
+                                trace_id, exc)
+                    return {"trace_id": trace_id, "action": "NO_TRADE",
+                            "ordered": False,
+                            "reason": str(sig.get("reason", "no-trade")),
+                            "signal": sig, "qty": 0.0}
+        if action not in ("LONG", "SHORT"):
+            _save_state(st, state_file)
+            log.info("[%s] NO_TRADE (%s: %s), tanpa order", trace_id,
+                     action, sig.get("reason", sig.get("thesis", "")))
+            return {"trace_id": trace_id, "action": action, "ordered": False,
+                    "reason": str(sig.get("reason", "no-trade")), "signal": sig, "qty": 0.0}
 
     # LLM second-opinion: VETO ONLY, fail-closed, default OFF.
     # OFF -> nol network call, perilaku identik seperti sebelumnya.

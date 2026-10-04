@@ -194,7 +194,9 @@ def evaluate(df: pd.DataFrame, funding_rate: float | None = None) -> dict:
         return _no_trade("tidak ada setup valid (filter EMA/ATR/BB/RSI/funding tidak terpenuhi)")
     acts = {s["action"] for s in cands}
     if len(acts) > 1:
-        return _no_trade("konflik: " + " vs ".join(f"{s['setup']}={s['action']}" for s in cands))
+        out = _no_trade("konflik: " + " vs ".join(f"{s['setup']}={s['action']}" for s in cands))
+        out["candidates"] = cands  # arbiter Fin boleh memilih satu sisi
+        return out
     # arah sama -> pilih confidence tertinggi (breakout diutamakan bila seri)
     best = max(cands, key=lambda s: (s["confidence"], s["setup"] == "TREND_BREAKOUT_H1"))
     if best["confidence"] < MIN_CONFIDENCE:

@@ -146,6 +146,94 @@ def _timeout(deadline: float) -> float:
     return max(0.5, min(PER_ATTEMPT_TIMEOUT_S, deadline - time.monotonic()))
 
 
+def _tiered_call(primary: str, fallback: str, api_key: str,
+                 system: str, prompt: str, parse, fail):
+    """Rantai L1(rf) -> L1(plain) -> L2(plain). parse(text)->dict tanpa model.
+    fail()->dict. Tak pernah raise."""
+    deadline = time.monotonic() + TOTAL_BUDGET_S
+    msgs = lambda force_json: [  # noqa: E731
+        {"role": "system", "content": system},
+        {"role": "user", "content": (prompt if not force_json
+                                     else prompt + "\nBalas HANYA objek JSON valid.")},
+    ]
+    tiers = ((primary, True, False, "L1"), (primary, False, True, "L1-plain"),
+             (fallback, False, True, "L2"))
+    for model, rf, force_json, tag in tiers:
+        if deadline - time.monotonic() <= 0:
+            break
+        try:
+            text = _post(model, api_key, msgs(force_json), rf, _timeout(deadline))
+            res = parse(text)
+            res["model"] = model
+            return res
+        except Exception as exc:  # noqa: BLE001 - lanjut tier berikut
+            logger.warning("llm-tier %s gagal (%s)", tag, type(exc).__name__)
+    return fail()
+
+
+_ARBITER_SYSTEM = (
+    "Kamu arbiter dua sinyal rule-based yang BERTENTANGAN untuk futures "
+    "BTCUSDT-PERP (satu LONG, satu SHORT, dari setup berbeda). Tugasmu HANYA "
+    "memilih SATU: balas HANYA satu objek JSON valid "
+    '{"pick": "LONG"|"SHORT"|"NEITHER", "confidence_mult": <0..1>, '
+    '"reason": "<singkat, sebut data>"}Pick sisi yang didukung tren, momentum, '
+    "funding, dan R:R. NEITHER bila keduanya lemah/meragukan. "
+    "Bila ragu -> NEITHER. Kamu TIDAK BOLEH mengusulkan harga/entry sendiri."
+)
+
+
+def _parse_pick(text: str) -> dict:
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("top-level JSON harus objek")
+    pick = str(data.get("pick", "")).strip().upper()
+    if pick not in ("LONG", "SHORT", "NEITHER"):
+        raise ValueError(f"pick tak dikenal: {pick!r}")
+    raw = data.get("confidence_mult", 1.0)
+    mult = 1.0 if raw is None else float(raw)
+    if not math.isfinite(mult):
+        raise ValueError("confidence_mult tak finite")
+    mult = min(max(mult, 0.0), 1.0)
+    return {"pick": pick, "confidence_mult": mult,
+            "reason": str(data.get("reason") or "")[:500], "model": ""}
+
+
+def _arb_neither(reason: str, model: str) -> dict:
+    return {"pick": "NEITHER", "confidence_mult": 1.0,
+            "reason": reason, "model": model}
+
+
+def arbitrate(long_sig: dict, short_sig: dict, market: dict) -> dict:
+    """Pilih LONG/SHORT/NEITHER dari dua sinyal bertentangan. Gagal -> NEITHER.
+
+    Batas wewenang: hanya memilih di antara dua usulan rule-based (atau
+    menolak keduanya). Tak pernah membuat sinyal dari nol.
+    """
+    primary, fallback = _resolve_models()
+    if not is_enabled():
+        return _arb_neither("llm-review-off", primary)
+    try:
+        la = str((long_sig or {}).get("action", "")).upper()
+        sa = str((short_sig or {}).get("action", "")).upper()
+    except Exception:  # noqa: BLE001
+        la, sa = "", ""
+    if la != "LONG" or sa != "SHORT":
+        return _arb_neither("invalid-input", primary)
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return _arb_neither("no-api-key", primary)
+    try:
+        prompt = ("Dua sinyal bertentangan. LONG: "
+                  + json.dumps(_compact(long_sig, market))
+                  + ". SHORT: " + json.dumps(_compact(short_sig, market))
+                  + ". Pilih satu.")
+    except Exception:  # noqa: BLE001
+        return _arb_neither("bad-input", primary)
+    return _tiered_call(primary, fallback, api_key, _ARBITER_SYSTEM,
+                         prompt, _parse_pick,
+                         lambda: _arb_neither("all-tiers-failed", fallback))
+
+
 def review(signal: dict, market: dict) -> dict:
     """Second-opinion VETO-ONLY. Tak pernah raise; gagal -> CONFIRM.
 
@@ -169,35 +257,6 @@ def review(signal: dict, market: dict) -> dict:
     except Exception:  # noqa: BLE001
         return _confirm("bad-input", primary)
 
-    deadline = time.monotonic() + TOTAL_BUDGET_S
-    # L1: model utama, structured output. Sebagian varian (mis. Fin) tidak
-    # mendukung response_format (balas kosong) -> ulangi tanpa response_format.
-    try:
-        text = _post(primary, api_key, _messages(prompt, False),
-                     True, _timeout(deadline))
-        res = _strict_parse(text)
-        res["model"] = primary
-        return res
-    except Exception as exc:  # noqa: BLE001 - fall through ke L1b
-        logger.warning("llm-review L1 gagal (%s)", type(exc).__name__)
-    if deadline - time.monotonic() > 0:
-        try:
-            text = _post(primary, api_key, _messages(prompt, True),
-                         False, _timeout(deadline))
-            res = _strict_parse(text)
-            res["model"] = primary
-            return res
-        except Exception as exc:  # noqa: BLE001 - fall through ke L2
-            logger.warning("llm-review L1-plain gagal (%s)", type(exc).__name__)
-    # L2: fallback sekali, tanpa response_format.
-    if deadline - time.monotonic() <= 0:
-        return _confirm("budget-exceeded", fallback)
-    try:
-        text = _post(fallback, api_key, _messages(prompt, True),
-                     False, _timeout(deadline))
-        res = _strict_parse(text)
-        res["model"] = fallback
-        return res
-    except Exception as exc:  # noqa: BLE001 - fail-closed
-        logger.warning("llm-review L2 gagal (%s)", type(exc).__name__)
-        return _confirm("all-tiers-failed", fallback)
+    return _tiered_call(primary, fallback, api_key, _SYSTEM,
+                         prompt, _strict_parse,
+                         lambda: _confirm("all-tiers-failed", fallback))
