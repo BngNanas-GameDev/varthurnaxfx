@@ -17,3 +17,24 @@ SEQ tidak di-wire ke live (`SEQ_ENABLED` default false). Pola terlalu jarang
 di H1 dan negatif di M5. Artikel benar soal "tunggu konfirmasi", tapi versi
 ketat ini bukan edge yang bisa dibuktikan. Jangan ulangi tanpa data baru /
 varian continuation + level signifikan.
+
+---
+
+# STEROID_3C — hasil backtest (CONDITIONAL ACCEPT, H1 only)
+
+Pola sederhana TradingView: C1 new-high/low + C2 close lampaui ekstrem C1,
+entry = ekstrem C1, SL = ekstrem lawan, TP 1.5R, konteks EMA+funding.
+
+## H1, 1000 bar real, split 70/30
+- IS (700 bar): 40 trade, winrate 0.475, net **-225.47**, dd -0.089
+- OOS (300 bar): 12 trade, winrate 0.667, net **+651.29**, dd -0.025
+- Gate OOS lolos (net>0, >=10 trade, dd>-0.08) TAPI IS negatif + OOS tipis
+  (12 trade) -> bukti LEMAH. HANYA forward-paper demo, BUKAN live.
+
+## M5, 5000 bar real, split 70/30
+- IS: negatif | OOS (1500 bar): 42 trade, net **-1631.89**, dd -0.163
+- **REJECT untuk M5.**
+
+## Keputusan
+Wire di `evaluate()` belakang `STEROID_ENABLED` (default false). H1 boleh
+forward-paper demo. M5 dilarang. Evaluasi ulang setelah >=30 trade forward.

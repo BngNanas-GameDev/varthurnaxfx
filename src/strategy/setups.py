@@ -22,6 +22,7 @@ import os
 import pandas as pd
 
 from src.strategy.seq import SEQ_PARAMS, evaluate_seq
+from src.strategy.steroid import evaluate_steroid
 
 # ------------------------------------------------------------- parameter eksplisit
 BREAKOUT_PARAMS = {
@@ -181,8 +182,14 @@ def evaluate(df: pd.DataFrame, funding_rate: float | None = None) -> dict:
             sig_seq = evaluate_seq(d, funding)
         except Exception:  # noqa: BLE001 - SEQ tak boleh mematikan evaluate
             sig_seq = None
+    sig_steroid = None
+    if os.getenv("STEROID_ENABLED", "false").lower() in ("1", "true", "yes"):
+        try:
+            sig_steroid = evaluate_steroid(d, funding)
+        except Exception:  # noqa: BLE001
+            sig_steroid = None
 
-    cands = [s for s in (sig_break, sig_mr, sig_seq) if s]
+    cands = [s for s in (sig_break, sig_mr, sig_seq, sig_steroid) if s]
     if not cands:
         return _no_trade("tidak ada setup valid (filter EMA/ATR/BB/RSI/funding tidak terpenuhi)")
     acts = {s["action"] for s in cands}
