@@ -82,8 +82,12 @@ def _exit_price(side: str, entry: float, ref: float, is_sl: bool) -> float:
 
 
 def run_backtest(df: pd.DataFrame, equity0: float = 10000.0,
-                 leverage: int = 10, max_holding_bars: int = 24) -> tuple[list, dict, list]:
-    """Loop bar-per-bar. Return (trades, metrics, equity_curve)."""
+                 leverage: int = 10, max_holding_bars: int = 24,
+                 signal_fn=None) -> tuple[list, dict, list]:
+    """Loop bar-per-bar. signal_fn(slice_df)->signal dict; default evaluate().
+    Return (trades, metrics, equity_curve)."""
+    if signal_fn is None:
+        signal_fn = evaluate
     if df is None or len(df) < WARMUP + 5:
         return [], compute_metrics([], [equity0]), [equity0]
     d = df.sort_values("open_time").reset_index(drop=True)
@@ -92,7 +96,7 @@ def run_backtest(df: pd.DataFrame, equity0: float = 10000.0,
     trades: list[dict] = []
     i = WARMUP
     while i < len(d) - 1:
-        sig = evaluate(d.iloc[: i + 1])
+        sig = signal_fn(d.iloc[: i + 1])
         if sig["action"] == "NO_TRADE":
             equity_curve.append(equity)
             i += 1

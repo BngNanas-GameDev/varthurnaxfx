@@ -17,7 +17,11 @@ Setiap sinyal membawa `thesis` + `thesis_breaker` (falsifikasi).
 
 from __future__ import annotations
 
+import os
+
 import pandas as pd
+
+from src.strategy.seq import SEQ_PARAMS, evaluate_seq
 
 # ------------------------------------------------------------- parameter eksplisit
 BREAKOUT_PARAMS = {
@@ -171,13 +175,19 @@ def evaluate(df: pd.DataFrame, funding_rate: float | None = None) -> dict:
 
     sig_break = _breakout_signal(d, last)
     sig_mr = _mr_signal(d, last, funding)
+    sig_seq = None
+    if os.getenv("SEQ_ENABLED", "false").lower() in ("1", "true", "yes"):
+        try:
+            sig_seq = evaluate_seq(d, funding)
+        except Exception:  # noqa: BLE001 - SEQ tak boleh mematikan evaluate
+            sig_seq = None
 
-    cands = [s for s in (sig_break, sig_mr) if s]
+    cands = [s for s in (sig_break, sig_mr, sig_seq) if s]
     if not cands:
         return _no_trade("tidak ada setup valid (filter EMA/ATR/BB/RSI/funding tidak terpenuhi)")
-    if len(cands) == 2 and cands[0]["action"] != cands[1]["action"]:
-        return _no_trade(f"konflik: {cands[0]['setup']}={cands[0]['action']} vs "
-                         f"{cands[1]['setup']}={cands[1]['action']}")
+    acts = {s["action"] for s in cands}
+    if len(acts) > 1:
+        return _no_trade("konflik: " + " vs ".join(f"{s['setup']}={s['action']}" for s in cands))
     # arah sama -> pilih confidence tertinggi (breakout diutamakan bila seri)
     best = max(cands, key=lambda s: (s["confidence"], s["setup"] == "TREND_BREAKOUT_H1"))
     if best["confidence"] < MIN_CONFIDENCE:

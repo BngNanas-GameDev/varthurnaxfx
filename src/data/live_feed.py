@@ -39,17 +39,27 @@ INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "1h": 3_600_000}
 DF_COLUMNS = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
 
 
-def _fetch_via_ccxt(interval: str = "1h", limit: int = 200) -> list:
+def _fetch_via_ccxt(interval: str = "1h", limit: int = 200,
+                    end_ms: int | None = None) -> list:
     import ccxt  # noqa: WPS433 - import lokal agar modul tetap importable tanpa ccxt
 
     ex = ccxt.binanceusdm({"enableRateLimit": True})
-    rows = ex.fetch_ohlcv(SYMBOL_CCXT, timeframe=interval, limit=limit)
+    since = (end_ms - limit * _interval_ms(interval)) if end_ms else None
+    rows = ex.fetch_ohlcv(SYMBOL_CCXT, timeframe=interval, since=since, limit=limit)
     return [list(r) for r in rows]
 
 
-def _fetch_via_http(interval: str = "1h", limit: int = 200) -> list:
+def _interval_ms(interval: str) -> int:
+    unit = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(interval[:-1]) * unit.get(interval[-1:], 3_600_000)
+
+
+def _fetch_via_http(interval: str = "1h", limit: int = 200,
+                    end_ms: int | None = None) -> list:
     """Fallback langsung ke fapi REST. Coba httpx, lalu urllib stdlib."""
     params = {"symbol": SYMBOL_SPOT, "interval": interval, "limit": limit}
+    if end_ms:
+        params["endTime"] = end_ms
     try:
         import httpx  # type: ignore
 
@@ -70,15 +80,17 @@ def _fetch_via_http(interval: str = "1h", limit: int = 200) -> list:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_klines(interval: str = "1h", limit: int = 200) -> list:
+def fetch_klines(interval: str = "1h", limit: int = 200,
+                 end_ms: int | None = None) -> list:
     """Ambil klines mentah publik (tanpa key).
 
     Urutan: ccxt binanceusdm -> fallback HTTP langsung ke fapi.
+    end_ms: paginasi mundur (ambil `limit` bar yang berakhir <= end_ms).
     Return: list rows (ccxt 6-kolom atau fapi 12-kolom, apa adanya).
     Raise: RuntimeError bila semua sumber gagal (caller yang fallback sintetis).
     """
     try:
-        rows = _fetch_via_ccxt(interval, limit)
+        rows = _fetch_via_ccxt(interval, limit, end_ms)
         if rows:
             return rows
     except Exception as e_ccxt:  # noqa: BLE001 - catat lalu fallback
@@ -86,7 +98,7 @@ def fetch_klines(interval: str = "1h", limit: int = 200) -> list:
     else:
         ccxt_err = None
     try:
-        rows = _fetch_via_http(interval, limit)
+        rows = _fetch_via_http(interval, limit, end_ms)
         if rows:
             return rows
     except Exception as e_http:  # noqa: BLE001
