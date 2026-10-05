@@ -112,9 +112,12 @@ def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
     out = {"exit_price": 0.0, "pnl": 0.0, "fee": 0.0, "funding": 0.0,
            "estimated": True, "reason": "unknown"}
 
-    # 1+2. exchange: realized pnl + exit price nyata
+    # 1+2. exchange: realized pnl + exit price nyata.
+    # Tanpa opened_ts TIDAK boleh dijumlahkan: default window Binance 7 hari
+    # akan mencampur PnL trade lain lalu diklaim "riil" (bug H3).
+    _since = _opened_ms(closed)
     try:
-        rz = client.fetch_realized(since_ms=_opened_ms(closed))
+        rz = client.fetch_realized(since_ms=_since) if _since else {}
     except Exception:  # noqa: BLE001
         rz = {}
     if not isinstance(rz, dict):
@@ -274,26 +277,30 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
     if ex_qty > 0 and not st.get("open_position"):
         side = str(ex_pos.get("side", "")).lower()
         action_side = "LONG" if side == "long" else "SHORT"
+        _entry_ex = _finite(ex_pos.get("entryPrice"))
+        # trace_id unik: "adopted-exchange" konstan menimpa open sebelumnya
+        # di dict journal.summarize() sehingga PnL trade salah (bug H4).
+        _adopt_id = "adopted-%d-%s" % (int(time.time() * 1000),
+                                       int(_entry_ex) if _entry_ex else 0)
         st["open_position"] = {"side": action_side, "qty": float(ex_qty),
-                               "entry": float(ex_pos.get("entryPrice") or 0.0),
+                               "entry": _entry_ex if _entry_ex else 0.0,
                                "sl": None, "tp": None,
-                               "trace_id": "adopted-exchange",
+                               "trace_id": _adopt_id,
                                "adopted": True,
                                "opened_ts": int(time.time() * 1000)}
         _save_state(st, state_file)
         log.info("[%s] ADOPT posisi exchange %s qty=%s, entry baru diblokir",
                  trace_id, action_side, ex_qty)
         try:  # jurnal tak boleh menggagalkan loop
-            _journal_open(trace_id="adopted-exchange", side=action_side,
+            _journal_open(trace_id=_adopt_id, side=action_side,
                           qty=float(ex_qty),
-                          entry=float(ex_pos.get("entryPrice") or 0.0),
+                          entry=_entry_ex if _entry_ex else 0.0,
                           sl=None, tp=None, source="adopted-exchange")
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] journal adopt gagal (%s)", trace_id, exc)
         _notify("ADOPT [%s] posisi exchange %s qty=%s entry=%s (entry baru diblokir)" % (
             _mode_label(), action_side, ex_qty,
-            ex_pos.get("entryPrice") if isinstance(ex_pos, dict) else "?"),
-            trace_id, log)
+            _entry_ex if _entry_ex else "?"), trace_id, log)
         return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
                 "reason": "adopted exchange position", "qty": 0.0}
     if ex_qty == 0 and st.get("open_position"):
@@ -331,14 +338,29 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         log.info("[%s] CLOSE realized pnl=%.4f fee=%.4f funding=%.4f net=%.4f exit=%.2f reason=%s",
                  trace_id, pnl, fee, funding, net, exit_px, reason)
 
-    # daily pnl: eksplisit (tests) atau best-effort dari client (0.0 bila gagal)
+    # daily pnl: eksplisit (tests) atau dari client.
+    # None = "tidak tahu" -> FAIL-CLOSED: rem daily loss tak boleh buta.
+    pnl_unknown = False
     if daily_pnl is None:
         try:
-            daily_pnl = float(client.get_daily_pnl())
+            _raw = client.get_daily_pnl()
         except Exception as exc:  # noqa: BLE001
-            log.warning("[%s] get_daily_pnl gagal (%s), pakai 0.0", trace_id, exc)
+            log.warning("[%s] get_daily_pnl gagal (%s)", trace_id, type(exc).__name__)
+            _raw = None
+        if _raw is None:
+            pnl_unknown = True
             daily_pnl = 0.0
-    st["daily_pnl"] = float(daily_pnl)
+        else:
+            daily_pnl = float(_raw)
+    st["daily_pnl"] = None if pnl_unknown else float(daily_pnl)
+
+    if pnl_unknown:
+        _save_state(st, state_file)
+        log.error("[%s] BLOCK daily PnL tak terbaca (fail-closed), tanpa order",
+                  trace_id)
+        return {"trace_id": trace_id, "action": "BLOCKED", "ordered": False,
+                "reason": "daily_pnl_unknown: rem daily loss buta, order diblokir",
+                "qty": 0.0}
 
     if st.get("halt_latched"):
         _save_state(st, state_file)
@@ -598,20 +620,35 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         return {"trace_id": trace_id, "action": action, "ordered": False,
                 "reason": live_reason, "signal": sig, "qty": qty}
 
+    _unprotected = False
+    res = None
     try:
         res = client.place_entry(side=side, qty=qty, trace_id=trace_id,
                                  sl_price=float(sl),
                                  tp_price=float(tp) if tp else 0.0)
     except Exception as exc:  # noqa: BLE001
-        _save_state(st, state_file)
-        log.warning("[%s] ORDER_ERROR %s %s (%s)", trace_id, side, qty, exc)
-        return {"trace_id": trace_id, "action": action, "ordered": False,
-                "reason": f"order error: {exc}", "signal": sig, "qty": qty}
-
+        # EntryUnprotectedError = entry SUDAH fill tapi SL/TP gagal attach.
+        # Posisi tetap harus dicatat supaya reconcile bisa menutupnya.
+        if getattr(exc, "entry_filled", False):
+            _unprotected = True
+            log.error("[%s] UNPROTECTED %s %s: %s -> STATE dicatat agar exit jalan",
+                      trace_id, side, qty, exc)
+            _notify("UNPROTECTED [%s] %s %s qty=%s attach SL/TP gagal (%s) - "
+                    "PERIKSA MANUAL" % (_mode_label(), symbol, side, qty,
+                                        type(exc).__name__), trace_id, log)
+        else:
+            log.warning("[%s] ORDER_ERROR %s %s (%s)", trace_id, side, qty,
+                        type(exc).__name__)
+            _save_state(st, state_file)
+            return {"trace_id": trace_id, "action": action, "ordered": False,
+                    "reason": f"order error: {type(exc).__name__}",
+                    "signal": sig, "qty": qty}
     st["open_position"] = {"side": action, "qty": qty, "entry": float(entry),
                            "sl": float(sl), "tp": float(tp) if tp else None,
                            "trace_id": trace_id,
                            "opened_ts": int(time.time() * 1000)}
+    if _unprotected:
+        st["open_position"]["unprotected"] = True
     _save_state(st, state_file)
     try:  # jurnal tak boleh menggagalkan loop
         setup = sig.get("setup") if isinstance(sig, dict) else None
@@ -630,5 +667,6 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
         _mode_label(), symbol, side, qty, entry, sl, tp, setup, conf, breaker),
         trace_id, log)
     return {"trace_id": trace_id, "action": action, "ordered": True,
-            "reason": "ok", "signal": sig, "qty": qty, "side": side,
-            "order": res}
+            "reason": "filled-but-unprotected" if _unprotected else "ok",
+            "signal": sig, "qty": qty, "side": side,
+            "unprotected": _unprotected, "order": res}

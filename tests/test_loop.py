@@ -156,7 +156,11 @@ def test_adopt_exchange_position_blocks_entry(client, state_file):
                                  state_file=state_file)
     assert res["ordered"] is False
     assert "adopted" in res["reason"]
-    assert load(state_file)["open_position"]["trace_id"] == "adopted-exchange"
+    # trace_id WAJIB unik per adopsi: dict journal.summarize() menimpa open
+    # dengan trace_id sama sehingga PnL trade salah.
+    pos = load(state_file)["open_position"]
+    assert pos["trace_id"].startswith("adopted-")
+    assert pos["trace_id"] != "adopted-exchange"
     client.place_entry.assert_not_called()
 
 
@@ -196,7 +200,8 @@ def test_close_sends_telegram(client, state_file, monkeypatch):
         "exit_price": 60500.0, "exit_ts": 1_700_000_000_000,
     }
     set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
-                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
+                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev",
+                  "opened_ts": 1_700_000_000_000},
                  state_file)
     client.get_position.return_value = {"contracts": 0.0}
     trading_loop.run_cycle(client, 1000.0, df=make_flat_gold(),

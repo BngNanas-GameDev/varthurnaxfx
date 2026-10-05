@@ -27,6 +27,16 @@ _RETRYABLE_CODES = {"-1003", "-1015"}
 _RETRYABLE_TEXT = ("timeout", "timed out", "connection", "rate limit", "418", "429", "5xx")
 
 
+class EntryUnprotectedError(RuntimeError):
+    """Entry ter-fill tetapi SL/TP gagal attach (posisi sempat telanjang).
+
+    `entry_filled=True` -> pemanggil WAJIB tetap mencatat posisi supaya
+    reconcile/exit tetap berjalan, walau order dicatat gagal.
+    """
+
+    entry_filled = True
+
+
 def _is_retryable(exc: Exception) -> bool:
     msg = str(exc).lower()
     if any(t in msg for t in _RETRYABLE_TEXT):
@@ -44,12 +54,16 @@ class BinanceClient:
         self,
         api_key: str = "",
         api_secret: str = "",
-        testnet: bool = True,
+        testnet: Optional[bool] = None,
         dry_run: Optional[bool] = None,
         max_retries: int = 3,
     ) -> None:
         if dry_run is None:
             dry_run = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+        if testnet is None:
+            # Default lama `testnet=True` diam-diam mengabaikan env
+            # BINANCE_TESTNET=false, jadi gate ALLOW_LIVE tak pernah aktif.
+            testnet = os.getenv("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes")
         self.dry_run = bool(dry_run)
         if not api_key:
             api_key = os.getenv("BINANCE_API_KEY", "")
@@ -61,6 +75,15 @@ class BinanceClient:
         if not self.dry_run:
             if not api_key or not api_secret:
                 raise RuntimeError("BINANCE_API_KEY/SECRET kosong (isi .env dulu)")
+            # Gate live WAJIB di lapisan client, bukan hanya di loop: daemon
+            # memakai client langsung (get_position/cancel_all) dan bisa
+            # menyentuh mainnet tanpa pernah lewat loop._live_trading_allowed.
+            demo = os.getenv("BINANCE_DEMO", "true").lower() in ("1", "true", "yes")
+            allow_live = os.getenv("ALLOW_LIVE", "").lower() in ("1", "true", "yes")
+            if not (testnet or demo) and not allow_live:
+                raise RuntimeError(
+                    "live trading diblokir: set ALLOW_LIVE=true eksplisit "
+                    "(BINANCE_DEMO=false + BINANCE_TESTNET=false)")
             self._exchange = self._build_exchange(api_key, api_secret, testnet)
 
     # -- setup -------------------------------------------------------------
@@ -185,7 +208,30 @@ class BinanceClient:
                 time.sleep(2 ** (attempt - 1))
                 # loop retries the create_order once after idempotency check
         # Attach native protective orders (reduce-only via closePosition).
-        self._attach_sltp_native(symbol, close_side, sl_price, tp_price, trace_id)
+        # Entry SUDAH fill di titik ini: bila attach gagal, posisi telanjang
+        # tanpa SL = risiko tak terbatas. Fail-closed: cancel semua order
+        # proteksi yang sempat terpasang, flatten paksa, lalu naikkan error
+        # dengan flag entry_filled supaya pemanggil tetap mencatat posisi.
+        try:
+            self._attach_sltp_native(symbol, close_side, sl_price, tp_price, trace_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("ATTACH SL/TP GAGAL setelah entry fill (%s) -> flatten paksa",
+                         type(exc).__name__)
+            try:
+                self._call_with_retry("cancel_all_orders", symbol)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._exchange.create_order(symbol, "MARKET", close_side.lower(),
+                                            None, None,
+                                            {"reduceOnly": True,
+                                             "newClientOrderId": f"{trace_id}-FLAT"})
+                logger.error("posisi di-flatten paksa: %s", trace_id)
+            except Exception as flat_exc:  # noqa: BLE001
+                logger.error("flatten GAGAL (%s) - PERIKSA MANUAL! trace=%s",
+                             type(flat_exc).__name__, trace_id)
+            raise EntryUnprotectedError(
+                f"entry filled tanpa proteksi, di-flatten: {exc}") from exc
         return entry
 
     def _attach_sltp_native(self, symbol: str, close_side: str,
@@ -217,24 +263,55 @@ class BinanceClient:
             logger.warning("idempotency lookup failed: %s", exc)
         return None
 
+    def _fetch_income_rows(self, symbol: str, start_ms: int,
+                           end_ms: int) -> list:
+        """Income history Binance via endpoint implisit ccxt.
+
+        PENTING: ccxt 4.5.x TIDAK punya `fetch_income` untuk Binance futures
+        (diverifikasi scripts/ccxt_income_probe.py: hasattr == False).
+        Yang tersedia: `fapiPrivateGetIncome` + `parse_income`.
+        """
+        ex = self._exchange
+        raw = self._call_with_retry(
+            "fapiPrivateGetIncome",
+            {"symbol": symbol, "startTime": int(start_ms),
+             "endTime": int(end_ms), "limit": 1000})
+        items = []
+        if isinstance(raw, dict):
+            items = raw.get("income") or raw.get("rows") or []
+        elif isinstance(raw, list):
+            items = raw
+        rows = []
+        for it in items:
+            try:
+                rows.append(ex.parse_income(it))
+            except Exception:  # noqa: BLE001 - item rusak -> skip
+                continue
+        return rows
+
     def fetch_realized(self, symbol: str = SYMBOL, since_ms: int | None = None) -> dict:
         """Realized PnL + fee + funding riil dari income history Binance.
 
-        Sumber kebenaran untuk notif CLOSE (markPrice tak ada saat posisi
-        sudah flat, sehingga exit price harus diambil dari eksekusi nyata).
-        Return {} bila gagal/tidak tersedia (DRY_RUN atau tanpa key).
+        Sumber kebenaran untuk notif CLOSE (markPrice tak ada saat posisi sudah
+        flat, sehingga exit price harus diambil dari eksekusi nyata).
+
+        FAIL-CLOSED: tanpa `since_ms` TIDAK dijumlahkan — default window
+        Binance adalah 7 hari sehingga PnL trade lain ikut tercampur dan
+        angka itu akan diklaim "riil" padahal bukan milik posisi ini.
         """
         out = {"realized_pnl": None, "fee": None, "funding": None,
                "exit_price": None, "exit_ts": None}
         if self.dry_run or self._exchange is None:
             return out
+        if not since_ms:
+            logger.warning("fetch_realized tanpa since_ms -> ditolak "
+                           "(menghindari pencampuran PnL trade lain)")
+            return out
+        now_ms = int(time.time() * 1000)
         try:
-            params: dict[str, Any] = {"symbol": symbol}
-            if since_ms:
-                params["startTime"] = int(since_ms)
-            rows = self._call_with_retry("fetch_income", params) or []
+            rows = self._fetch_income_rows(symbol, int(since_ms), now_ms)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("fetch_realized gagal: %s", exc)
+            logger.warning("fetch_realized gagal: %s", type(exc).__name__)
             return out
         realized = fee = funding = 0.0
         for r in rows:
@@ -256,13 +333,13 @@ class BinanceClient:
         # exit price: trade terakhir dari window (harga eksekusi nyata)
         try:
             trades = self._call_with_retry(
-                "fetch_my_trades", symbol, since_ms) or []
+                "fetch_my_trades", symbol, int(since_ms)) or []
             if trades:
                 last = trades[-1]
                 exit_price = float(last.get("price") or 0.0) or None
                 exit_ts = last.get("timestamp")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("fetch_my_trades gagal: %s", exc)
+            logger.warning("fetch_my_trades gagal: %s", type(exc).__name__)
         out.update({"realized_pnl": realized, "fee": fee, "funding": funding,
                     "exit_price": exit_price, "exit_ts": exit_ts})
         return out
@@ -285,15 +362,41 @@ class BinanceClient:
                 return p
         return {"symbol": symbol, "contracts": 0.0}
 
-    def get_daily_pnl(self) -> float:
-        """Realized daily PnL fraction (e.g. -0.05 == -5%). Best-effort via
-        income history; falls back to 0.0 when unavailable."""
+    def get_daily_pnl(self) -> Optional[float]:
+        """Realized daily PnL sebagai FRAKSI equity (mis. -0.05 == -5%).
+
+        Fail-closed: None bila tak bisa dihitung. Nilai 0.0 hanya berarti
+        "belum rugi hari ini"; None berarti "tidak tahu" dan pemanggil
+        WAJIB memblokir order (rem daily loss tak boleh buta).
+        """
         if self.dry_run or self._exchange is None:
             return 0.0
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - 24 * 3600 * 1000
+        realized = 0.0
         try:
-            since = int((time.time() - 24 * 3600) * 1000)
-            income = self._call_with_retry("fetch_balance")
-            _ = (since, income)
+            for r in self._fetch_income_rows(SYMBOL, start_ms, now_ms):
+                info = r.get("info", {}) if isinstance(r, dict) else {}
+                if str(info.get("incomeType") or r.get("type") or "") != "REALIZED_PNL":
+                    continue
+                try:
+                    realized += float(r.get("amount", info.get("income")))
+                except (TypeError, ValueError):
+                    continue
         except Exception as exc:  # noqa: BLE001
-            logger.warning("get_daily_pnl fallback 0.0: %s", exc)
-        return 0.0
+            logger.warning("get_daily_pnl tak terbaca: %s", type(exc).__name__)
+            return None
+        try:
+            bal = self._call_with_retry("fetch_balance") or {}
+            usdt = bal.get("USDT") or bal.get("total") or {}
+            equity = float(usdt.get("total") or 0.0)
+            if equity <= 0:
+                # fallback: total seluruh currency
+                equity = float(bal.get("total") or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_daily_pnl balance gagal: %s", type(exc).__name__)
+            return None
+        if equity <= 0:
+            logger.warning("get_daily_pnl equity 0 -> None")
+            return None
+        return realized / equity

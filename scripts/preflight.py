@@ -234,6 +234,30 @@ def check_killswitch_section() -> None:
           "validate_order(daily_pnl=%s) -> rejected (%s)" % (at, reason))
 
 
+def check_operator_visibility(file_vars: dict[str, str]) -> None:
+    """Operator harus benar-benar menerima alert; kalau tidak, semua rem
+    (HALT/CLOSE/UNPROTECTED) hanyaDiam di log."""
+    print("--- (f) alert delivery + data writability ---")
+    eff = lambda k: os.getenv(k, file_vars.get(k, ""))  # noqa: E731
+    tg = bool(eff("TELEGRAM_BOT_TOKEN")) and bool(eff("TELEGRAM_CHAT_ID"))
+    dc = bool(eff("DISCORD_WEBHOOK_URL"))
+    check("alert-configured", tg or dc,
+          "telegram=%s discord=%s (WAJIB salah satu: tanpa ini CLOSE/HALT tak sampai)"
+          % (tg, dc))
+    data_dir = PROJECT_ROOT / "data"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        probe = data_dir / ".preflight_write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        writable = True
+    except OSError as exc:
+        writable = False
+        detail = str(exc)
+    check("data-dir-writable", writable,
+          "data/ %s (jurnal + STATE butuh tulis)" % ("writable" if writable else detail))
+
+
 def main() -> int:
     print("=== PREFLIGHT mainnet readiness (READ-ONLY, no orders/network/writes) ===")
     print("code constants: loop.LEVERAGE=%s guard.MAX_LEVERAGE=%s "
@@ -243,6 +267,7 @@ def main() -> int:
     check_risk_config()
     check_order_guard()
     check_killswitch_section()
+    check_operator_visibility(file_vars)
     n_fail = sum(1 for _, ok, _ in results if not ok)
     print("--- CHECKLIST: %d/%d PASS, %d FAIL ---"
           % (len(results) - n_fail, len(results), n_fail))

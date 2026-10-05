@@ -293,6 +293,16 @@ def test_opened_ms_passed_to_exchange_as_since_filter():
     trading_loop._resolve_exit(client, dict(LONG_POS), {})
     assert client.since_calls == [LONG_POS["opened_ts"]]
 
-    client2 = StubClient(EMPTY_INCOME)
-    trading_loop._resolve_exit(client2, {"side": "LONG", "entry": 60000.0}, {})
-    assert client2.since_calls == [None]      # tak ada timestamp -> tanpa filter
+
+def test_no_opened_ts_means_no_exchange_call_at_all():
+    """Tanpa opened_ts, income history TAK boleh dipanggil sama sekali.
+
+    Default window Binance = 7 hari, jadi penjumlahan tanpa since_ms akan
+    mencampur PnL trade lain lalu angka itu diklaim "riil" (bug H3).
+    """
+    client = StubClient(EMPTY_INCOME)
+    out = trading_loop._resolve_exit(
+        client, {"side": "LONG", "entry": 60000.0}, {})
+    assert client.since_calls == []
+    assert out["estimated"] is True
+    assert out["reason"] != "realized"

@@ -146,7 +146,8 @@ def test_loop_order_hook_records_open(client, state_file, jfile):
 
 def test_loop_closed_externally_hook_records_close(client, state_file, jfile):
     set_position({"side": "LONG", "qty": 0.03, "entry": 60000.0,
-                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev"},
+                  "sl": 59700.0, "tp": 60600.0, "trace_id": "prev",
+                  "opened_ts": 1_700_000_000_000},
                  state_file)
     client.get_position.return_value = {"contracts": 0.0}
     client.fetch_realized.return_value = {

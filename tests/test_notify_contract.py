@@ -34,7 +34,8 @@ API_SECRET = "SENTINEL-SECRET-DO-NOT-LEAK"
 PNL_RE = re.compile(r"PnL ([+-]?\d+\.\d{2}) USDT")
 BAD_TOKENS = ("None", "nan", "NaN", "undefined", "Infinity", "inf")
 LONG_POS = {"side": "LONG", "qty": 0.03, "entry": 60000.0, "sl": 59700.0,
-            "tp": 60600.0, "trace_id": "prev"}
+            "tp": 60600.0, "trace_id": "prev",
+            "opened_ts": 1_700_000_000_000}
 
 
 class StubClient:
