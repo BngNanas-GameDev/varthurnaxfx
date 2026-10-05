@@ -17,11 +17,21 @@ POLL_INTERVAL_S = float(os.getenv("POLL_INTERVAL_S", "5"))
 WS_STALE_S = 10.0  # WS-stale check threshold (locked spec)
 
 
-def check_killswitch(daily_pnl: float, halt_latched: bool) -> bool:
-    """Return True when trading must halt: daily -5% or latched STATE."""
+def check_killswitch(daily_pnl, halt_latched: bool) -> bool:
+    """Return True when trading must halt.
+
+    `daily_pnl is None` berarti PnL tak terbaca (exchange/gateway) -> halt
+    True (fail-closed). Rem daily loss tak boleh buta karena angka 0.0 yang
+    palsu; nilai None juga tak bisa dibandingkan dengan float.
+    """
     if halt_latched:
         return True
-    return daily_pnl <= -0.05
+    if daily_pnl is None:
+        return True
+    try:
+        return float(daily_pnl) <= -0.05
+    except (TypeError, ValueError):
+        return True
 
 
 def run_loop(poll_interval: float = POLL_INTERVAL_S,
@@ -90,10 +100,20 @@ def run_loop(poll_interval: float = POLL_INTERVAL_S,
                 client.get_position()  # keep-alive REST read
                 last_ws_msg_ts = time.time()
             if check_killswitch(daily_pnl, halt_latched):
+                reason = ("daily_pnl_unknown" if daily_pnl is None
+                          else "daily_stop")
+                if not halt_latched:
+                    logger.error("KILLSWITCH: halt reason=%s pnl=%s",
+                                 reason, daily_pnl)
+                    send_alert("KILLSWITCH [%s] trading dihentikan, "
+                               "resume manual (pnl=%s)"
+                               % (reason, daily_pnl))
                 halt_latched = True
-                logger.error("KILLSWITCH: halt pnl=%s", daily_pnl)
-                send_alert(f"KILLSWITCH halt latched (daily_pnl={daily_pnl})")
-                client.cancel_all()
+                try:
+                    client.cancel_all()
+                except Exception as exc:  # noqa: BLE001 - jangan matikan daemon
+                    logger.error("cancel_all saat halt gagal: %s",
+                                 type(exc).__name__)
             if os.getenv("ENABLE_STRATEGY", "false").lower() in ("1", "true", "yes"):
                 # Strategy paper-trading (testnet). Error di sini tak boleh
                 # mematikan daemon: tangkap, log, lanjut iterasi.
