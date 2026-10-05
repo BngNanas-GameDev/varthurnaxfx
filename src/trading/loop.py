@@ -15,6 +15,7 @@ tanpa ALLOW_LIVE). Semua keputusan di-log dengan trace_id (uuid4).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -67,6 +68,28 @@ def _live_trading_allowed() -> tuple[bool, str]:
     return False, "live-blocked: BINANCE_TESTNET=false tanpa ALLOW_LIVE"
 
 
+def _finite(value, default: float = 0.0) -> float:
+    """Float aman: non-numerik / NaN / inf -> ``default``.
+
+    NaN tak boleh bocor ke notif ("PnL nan USDT") atau ke jurnal: data rusak
+    diperlakukan sama seperti data tidak ada.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _finite_or_none(value) -> float | None:
+    """float finite, atau ``None`` bila data absen/tak valid (NaN, inf, teks)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
     """Exit price + PnL riil untuk posisi yang tertutup di luar STATE.
 
@@ -77,17 +100,15 @@ def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
       4. hitung dari (entry, sl, tp) -> exit = sl atau tp mana yang realistis
 
     Return dict {exit_price, pnl, fee, funding, estimated, reason}.
-    estimated=False bila berasal dari data exchange nyata.
+    estimated=False bila berasal dari data exchange nyata. Data NaN/inf/teks
+    diperlakukan sebagai "tak ada data" (tak pernah jadi PnL NaN di notif).
     """
     side = str((closed or {}).get("side", "")).upper()
     sign = 1.0 if side == "LONG" else -1.0
-    try:
-        entry_px = float((closed or {}).get("entry") or 0.0)
-        qty_c = float((closed or {}).get("qty") or 0.0)
-        sl = float((closed or {}).get("sl") or 0.0)
-        tp = float((closed or {}).get("tp") or 0.0)
-    except (TypeError, ValueError):
-        entry_px = qty_c = sl = tp = 0.0
+    entry_px = _finite((closed or {}).get("entry"))
+    qty_c = _finite((closed or {}).get("qty"))
+    sl = _finite((closed or {}).get("sl"))
+    tp = _finite((closed or {}).get("tp"))
     out = {"exit_price": 0.0, "pnl": 0.0, "fee": 0.0, "funding": 0.0,
            "estimated": True, "reason": "unknown"}
 
@@ -96,19 +117,16 @@ def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
         rz = client.fetch_realized(since_ms=_opened_ms(closed))
     except Exception:  # noqa: BLE001
         rz = {}
-    if isinstance(rz, dict) and rz.get("realized_pnl") is not None:
-        try:
-            out["pnl"] = float(rz.get("realized_pnl") or 0.0)
-            out["fee"] = abs(float(rz.get("fee") or 0.0))
-            out["funding"] = float(rz.get("funding") or 0.0)  # +ekspsi, -dibayar
-            out["estimated"] = False
-            out["reason"] = "realized"
-        except (TypeError, ValueError):
-            pass
-        try:
-            ep = float(rz.get("exit_price") or 0.0)
-        except (TypeError, ValueError):
-            ep = 0.0
+    if not isinstance(rz, dict):
+        rz = {}
+    rz_pnl = _finite_or_none(rz.get("realized_pnl"))
+    if rz_pnl is not None:
+        out["pnl"] = rz_pnl
+        out["fee"] = abs(_finite(rz.get("fee")))
+        out["funding"] = _finite(rz.get("funding"))  # +ekspsi, -dibayar
+        out["estimated"] = False
+        out["reason"] = "realized"
+        ep = _finite(rz.get("exit_price"))
         if ep > 0:
             out["exit_price"] = ep
             out["reason"] = _classify_exit(side, ep, entry_px, sl, tp)
@@ -118,39 +136,43 @@ def _resolve_exit(client, closed: dict, ex_pos: dict) -> dict:
     exit_px = 0.0
     if isinstance(ex_pos, dict):
         for key in ("markPrice", "mark_price", "mark", "lastPrice", "last_price"):
-            try:
-                v = float(ex_pos.get(key) or 0.0)
-            except (TypeError, ValueError):
-                continue
+            v = _finite(ex_pos.get(key), default=-1.0)
             if v > 0:
                 exit_px = v
                 break
     if exit_px <= 0:
         # 4. exit_price tak diketahui -> pakai SL atau TP yang tercatat
         exit_px = sl if sl > 0 else tp
-        out["estimated"] = True
+        # estimated melacak sumber ANGKA PnL: PnL dari income history exchange
+        # bukan estimasi walau exit price-nya cuma tebakan level STATE.
+        out["estimated"] = rz_pnl is None
     if exit_px <= 0:
         exit_px = entry_px
     out["exit_price"] = exit_px
-    out["reason"] = _classify_exit(side, exit_px, entry_px, sl, tp)
-    if not (isinstance(rz, dict) and rz.get("realized_pnl") is not None):
+    if rz_pnl is None:
+        out["reason"] = _classify_exit(side, exit_px, entry_px, sl, tp)
         out["pnl"] = (exit_px - entry_px) * qty_c * sign
+    # rz_pnl riil tapi exit price hanya tebakan level STATE: reason tetap
+    # "realized" -> tak mengklaim SL/TP pasti dari harga yang dikarang.
     return out
 
 
 def _classify_exit(side: str, exit_px: float, entry_px: float,
                    sl: float, tp: float) -> str:
     """Tentukan SL / TP / unknown dari harga exit vs level di STATE."""
-    if exit_px <= 0:
+    px = _finite_or_none(exit_px)
+    if px is None or px <= 0:
         return "unknown"
-    tol = max(entry_px * 0.0005, 1e-9)
-    if sl > 0 and (abs(exit_px - sl) <= tol or
-                   (side == "LONG" and exit_px <= sl) or
-                   (side == "SHORT" and exit_px >= sl)):
+    entry = _finite(entry_px)
+    sl_px, tp_px = _finite(sl), _finite(tp)
+    tol = max(entry * 0.0005, 1e-9)
+    if sl_px > 0 and (abs(px - sl_px) <= tol or
+                      (side == "LONG" and px <= sl_px) or
+                      (side == "SHORT" and px >= sl_px)):
         return "stop-loss"
-    if tp > 0 and (abs(exit_px - tp) <= tol or
-                   (side == "LONG" and exit_px >= tp) or
-                   (side == "SHORT" and exit_px <= tp)):
+    if tp_px > 0 and (abs(px - tp_px) <= tol or
+                      (side == "LONG" and px >= tp_px) or
+                      (side == "SHORT" and px <= tp_px)):
         return "take-profit"
     return "manual/unknown"
 
