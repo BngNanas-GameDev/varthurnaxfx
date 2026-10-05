@@ -71,6 +71,17 @@ def test_sends_symbol_starttime_endtime():
     assert params["endTime"] > 1000          # jendela tertutup, bukan "sampai kapan saja"
 
 
+def test_unified_symbol_converted_to_raw():
+    """Endpoint implisit fapi menolak "BTC/USDT:USDT" dengan BadSymbol."""
+    from execution.binance_client import SYMBOL, SYMBOL_RAW
+
+    ex = _ex(income=_rows())
+    _client(ex).fetch_realized(symbol=SYMBOL, since_ms=1000)
+    params = ex.fapiPrivateGetIncome.call_args[0][0]
+    assert params["symbol"] == SYMBOL_RAW == "BTCUSDT"
+    assert "/" not in params["symbol"]
+
+
 def test_without_since_ms_is_refused():
     """Tanpa since_ms default window Binance 7 hari -> PnL trade lain tercampur."""
     ex = _ex(income=_rows({"income": "999.0", "incomeType": "REALIZED_PNL"}))

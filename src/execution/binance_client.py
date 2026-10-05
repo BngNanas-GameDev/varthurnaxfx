@@ -20,6 +20,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 SYMBOL = "BTC/USDT:USDT"  # ccxt unified symbol for BTCUSDT-PERP
+SYMBOL_RAW = "BTCUSDT"    # endpoint implisit fapi hanya terima simbol mentah
 DEFAULT_LEVERAGE = 10
 
 # Binance error codes / messages that are safe to retry with backoff.
@@ -272,9 +273,12 @@ class BinanceClient:
         Yang tersedia: `fapiPrivateGetIncome` + `parse_income`.
         """
         ex = self._exchange
+        # Endpoint implisit fapi menolak simbol unified ("BTC/USDT:USDT")
+        # dengan BadSymbol -> kirim simbol mentah Binance ("BTCUSDT").
+        raw_symbol = SYMBOL_RAW if "/" in symbol or ":" in symbol else symbol
         raw = self._call_with_retry(
             "fapiPrivateGetIncome",
-            {"symbol": symbol, "startTime": int(start_ms),
+            {"symbol": raw_symbol, "startTime": int(start_ms),
              "endTime": int(end_ms), "limit": 1000})
         items = []
         if isinstance(raw, dict):
@@ -375,7 +379,7 @@ class BinanceClient:
         start_ms = now_ms - 24 * 3600 * 1000
         realized = 0.0
         try:
-            for r in self._fetch_income_rows(SYMBOL, start_ms, now_ms):
+            for r in self._fetch_income_rows(SYMBOL_RAW, start_ms, now_ms):
                 info = r.get("info", {}) if isinstance(r, dict) else {}
                 if str(info.get("incomeType") or r.get("type") or "") != "REALIZED_PNL":
                     continue
