@@ -625,7 +625,8 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
     try:
         res = client.place_entry(side=side, qty=qty, trace_id=trace_id,
                                  sl_price=float(sl),
-                                 tp_price=float(tp) if tp else 0.0)
+                                 tp_price=float(tp) if tp else 0.0,
+                                 signal_entry=float(entry))
     except Exception as exc:  # noqa: BLE001
         # EntryUnprotectedError = entry SUDAH fill tapi SL/TP gagal attach.
         # Posisi tetap harus dicatat supaya reconcile bisa menutupnya.
@@ -643,8 +644,19 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
             return {"trace_id": trace_id, "action": action, "ordered": False,
                     "reason": f"order error: {type(exc).__name__}",
                     "signal": sig, "qty": qty}
-    st["open_position"] = {"side": action, "qty": qty, "entry": float(entry),
-                           "sl": float(sl), "tp": float(tp) if tp else None,
+    # Level final = yang BENAR-BENAR terpasang di exchange (bisa berbeda dari
+    # hasil re-anchor karena harga bergerak lagi antara fill dan attach).
+    _fill = _finite((res or {}).get("filled_price")) if isinstance(res, dict) else 0.0
+    _sl_final = _finite((res or {}).get("sl_price")) if isinstance(res, dict) else 0.0
+    _tp_final = _finite((res or {}).get("tp_price")) if isinstance(res, dict) else 0.0
+    if _sl_final <= 0:
+        _sl_final = float(sl)
+    if _tp_final <= 0:
+        _tp_final = float(tp) if tp else 0.0
+    _entry_final = _fill if _fill > 0 else float(entry)
+
+    st["open_position"] = {"side": action, "qty": qty, "entry": _entry_final,
+                           "sl": _sl_final, "tp": _tp_final or None,
                            "trace_id": trace_id,
                            "opened_ts": int(time.time() * 1000)}
     if _unprotected:
@@ -653,19 +665,20 @@ def run_cycle(client, equity: float, df=None, symbol: str = SYMBOL,
     try:  # jurnal tak boleh menggagalkan loop
         setup = sig.get("setup") if isinstance(sig, dict) else None
         _journal_open(trace_id=trace_id, side=action, qty=qty,
-                      entry=float(entry), sl=float(sl),
-                      tp=float(tp) if tp else None,
+                      entry=_entry_final, sl=_sl_final,
+                      tp=_tp_final or None,
                       source=str(setup or "unknown"))
     except Exception as exc:  # noqa: BLE001
         log.warning("[%s] journal open gagal (%s)", trace_id, exc)
-    log.info("[%s] ORDER %s %s entry=%s sl=%s tp=%s clientOrderId=%s -> %s",
-             trace_id, symbol, side, entry, sl, tp, trace_id, res)
+    log.info("[%s] ORDER %s %s qty=%s entry=%s sl=%s tp=%s clientOrderId=%s -> %s",
+             trace_id, symbol, side, qty, _entry_final, _sl_final, _tp_final,
+             trace_id, res)
     setup = sig.get("setup") if isinstance(sig, dict) else None
     conf = sig.get("confidence") if isinstance(sig, dict) else None
     breaker = sig.get("thesis_breaker") if isinstance(sig, dict) else None
     _notify("ENTRY [%s] %s %s qty=%s entry=%s sl=%s tp=%s setup=%s conf=%s breaker=%s" % (
-        _mode_label(), symbol, side, qty, entry, sl, tp, setup, conf, breaker),
-        trace_id, log)
+        _mode_label(), symbol, side, qty, _entry_final, _sl_final, _tp_final,
+        setup, conf, breaker), trace_id, log)
     return {"trace_id": trace_id, "action": action, "ordered": True,
             "reason": "filled-but-unprotected" if _unprotected else "ok",
             "signal": sig, "qty": qty, "side": side,
